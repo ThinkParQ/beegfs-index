@@ -1,0 +1,75 @@
+name: Release packages
+on:
+  push:
+    tags:
+      - '*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    env:
+      BEEGFS_INDEX_VERSION: ${{ github.event.inputs.version || github.ref_name }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y \
+            make libpcre2-dev libattr1-dev \
+            pkg-config git wget xz-utils \
+            autoconf automake libtool dpkg-dev rpm \
+            qemu-user-static
+
+      - name: Install zig
+        run: |
+          wget -q https://ziglang.org/download/0.13.0/zig-linux-x86_64-0.13.0.tar.xz
+          tar xf zig-linux-x86_64-0.13.0.tar.xz
+          sudo mv zig-linux-x86_64-0.13.0 /opt/zig
+          rm zig-linux-x86_64-0.13.0.tar.xz
+
+      - name: Build aarch64 RPM
+        run: TARGET_ARCH=aarch64 bash .ci/packages.sh rpm
+
+      - name: Build aarch64 DEB
+        run: TARGET_ARCH=aarch64 bash .ci/packages.sh deb
+
+      - name: Build x86_64 RPM
+        run: bash .ci/packages.sh rpm
+
+      - name: Build x86_64 DEB
+        run: bash .ci/packages.sh deb
+
+      - name: Generate checksums
+        run: |
+          cd packages
+          for file in *; do [ -f "$file" ] && sha256sum "$file" >> checksums.txt; done
+
+      - name: Import GPG key
+        uses: crazy-max/ghaction-import-gpg@2dc316deee8e90f13e1a351ab510b4d5bc0c82cd # v7
+        with:
+          gpg_private_key: ${{ secrets.PUBLICREPO_GPGPACKAGEKEY }}
+          passphrase: ${{ secrets.PUBLICREPO_GPGPACKAGEPASSPHRASE }}
+
+      - name: Sign checksums file
+        run: |
+          cd packages
+          export GPG_TTY=$(tty)
+          gpg --pinentry-mode loopback --passphrase ${{ secrets.PUBLICREPO_GPGPACKAGEPASSPHRASE }} \
+            --trust-model always --detach-sign -o checksums.txt.sig -r packages@beegfs.com checksums.txt
+
+      - name: Create Release
+        uses: ncipollo/release-action@339a81892b84b4eeb0f6e744e4574d79d0d9b8dd #v1.21.0
+        with:
+          artifacts: "packages/*.deb,packages/*.rpm,packages/checksums*"
+          allowUpdates: true
+          updateOnlyUnreleased: true
+          removeArtifacts: true
+          generateReleaseNotes: true
+          draft: false
