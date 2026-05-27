@@ -14,11 +14,12 @@
 #define BEEGFS_IOCTL_ENTRYID_MAXLEN           26
 #define BEEGFS_IOCTL_FILENAME_MAXLEN          256
 #define BEEGFS_IOCTL_MAX_STRIPE_TARGETS       256
+#define BEEGFS_IOCTL_MAX_RST_IDS              256
 
 #define BEEGFS_IOCNUM_GET_STRIPETARGET        26
 
 #define BEEGFS_IOCTYPE_ID                     'f'
-#define BEEGFS_IOCTL_NODESTRID_BUFLEN         256
+#define BEEGFS_IOCTL_NODEALIAS_BUFLEN         256
 
 // stripe pattern types
 #define BEEGFS_STRIPEPATTERN_INVALID          0
@@ -47,8 +48,8 @@ struct BeegfsIoctl_GetStripeTargetV2_Arg
    uint32_t primaryNodeID; // node ID of target (if unmirrored) or primary target (if mirrored)
    uint32_t secondaryNodeID; // node ID of secondary target, or 0 if unmirrored
 
-   char primaryNodeStrID[BEEGFS_IOCTL_NODESTRID_BUFLEN];
-   char secondaryNodeStrID[BEEGFS_IOCTL_NODESTRID_BUFLEN];
+   char primaryNodeAlias[BEEGFS_IOCTL_NODEALIAS_BUFLEN];
+   char secondaryNodeAlias[BEEGFS_IOCTL_NODEALIAS_BUFLEN];
 };
 
 
@@ -69,8 +70,6 @@ struct BeegfsIoctl_GetEntryInfo_Arg
    int featureFlags;
 };
 
-#define BEEGFS_IOC_GETVERSION     _IOR( \
-   BEEGFS_IOCTYPE_ID, BEEGFS_IOCNUM_GETVERSION, long)
 #define BEEGFS_IOC_GET_STRIPEINFO          _IOR( \
    BEEGFS_IOCTYPE_ID, BEEGFS_IOCNUM_GET_STRIPEINFO, struct BeegfsIoctl_GetStripeInfo_Arg)
 #define BEEGFS_IOC_GETENTRYINFO             _IOR( \
@@ -122,7 +121,7 @@ struct BeegfsIoctl_GetEntryInfoV2_Arg
    uint16_t rstCoolDownPeriod;
    uint16_t rstFilePolicies;
    uint32_t numRSTIds;
-   uint32_t rstIds[BEEGFS_IOCTL_MAX_STRIPE_TARGETS];
+   uint32_t rstIds[BEEGFS_IOCTL_MAX_RST_IDS];
 
    /* Session and state info */
    uint32_t numSessionsRead;
@@ -157,10 +156,12 @@ static inline bool beegfs_getEntryInfoV2(int dirfd, const char* filename,
  * @param featureFlags pointer to an int in which the feature flags shall be stored
  * @return success/failure
  */
-bool beegfs_getEntryInfo(int fd, uint32_t* ownerID, char* parentEntryID,
+static inline bool beegfs_getEntryInfo(int fd, uint32_t* ownerID, char* parentEntryID,
       char* entryID, int* entryType, int* featureFlags)
 {
    struct BeegfsIoctl_GetEntryInfo_Arg arg;
+
+   memset(&arg, 0, sizeof(arg));
 
    if(ioctl(fd, BEEGFS_IOC_GETENTRYINFO, &arg))
    {
@@ -185,7 +186,7 @@ bool beegfs_getEntryInfo(int fd, uint32_t* ownerID, char* parentEntryID,
  * @param outNumTargets number of targets for striping.
  * @return true on success, false on error (in which case errno will be set).
  */
-bool beegfs_getStripeInfo(int fd, unsigned* outPatternType, unsigned* outChunkSize,
+static inline bool beegfs_getStripeInfo(int fd, unsigned* outPatternType, unsigned* outChunkSize,
    uint16_t* outNumTargets)
 {
    struct BeegfsIoctl_GetStripeInfo_Arg getStripeInfo;
@@ -212,7 +213,7 @@ bool beegfs_getStripeInfo(int fd, unsigned* outPatternType, unsigned* outChunkSi
  *        stripe target
  * @return true on success, false on error (in which case errno will be set).
  */
-bool beegfs_getStripeTargetV2(int fd, uint32_t targetIndex,
+static inline bool beegfs_getStripeTargetV2(int fd, uint32_t targetIndex,
    struct BeegfsIoctl_GetStripeTargetV2_Arg* outTargetInfo)
 {
    memset(outTargetInfo, 0, sizeof(*outTargetInfo));
@@ -231,7 +232,7 @@ bool beegfs_getStripeTargetV2(int fd, uint32_t targetIndex,
  * @param out    Pointer to struct that will be filled with entry and stripe info.
  * @return true on success, false on error (errno will be set).
  */
-bool beegfs_getEntryInfoV2(int dirfd, const char* filename,
+static inline bool beegfs_getEntryInfoV2(int dirfd, const char* filename,
    struct BeegfsIoctl_GetEntryInfoV2_Arg* out)
 {
    memset(out, 0, sizeof(*out));
