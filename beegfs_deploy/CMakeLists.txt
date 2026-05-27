@@ -83,6 +83,7 @@ if(HAVE_STATX)
 endif()
 
 pkg_search_module(PCRE2 REQUIRED libpcre2-8)
+add_definitions(-DPCRE2_CODE_UNIT_WIDTH=8) # needed by external_copy.h
 pkg_search_module(ZLIB  zlib)
 if(ZLIB_FOUND)
   add_definitions(-DHAVE_ZLIB=1)
@@ -150,7 +151,8 @@ set(GUFI_SOURCES
   "${GUFI_SRC}/addqueryfuncs.c"   "${GUFI_SRC}/bf.c"
   "${GUFI_SRC}/compress.c"        "${GUFI_SRC}/dbutils.c"
   "${GUFI_SRC}/debug.c"           "${GUFI_SRC}/descend.c"
-  "${GUFI_SRC}/external.c"        "${GUFI_SRC}/gufi_vt.c"
+  "${GUFI_SRC}/external_attach.c" "${GUFI_SRC}/external_copy.c"
+  "${GUFI_SRC}/gufi_vt.c"
   "${GUFI_SRC}/histogram.c"       "${GUFI_SRC}/outfiles.c"
   "${GUFI_SRC}/path_list.c"       "${GUFI_SRC}/plugin.c"
   "${GUFI_SRC}/popen_argv.c"      "${GUFI_SRC}/print.c"
@@ -184,7 +186,7 @@ set_target_properties(gufi_dir2index PROPERTIES ENABLE_EXPORTS TRUE)
 
 add_library(gufi_query_lib OBJECT
   "${GUFI_SRC}/gufi_query/PoolArgs.c"       "${GUFI_SRC}/gufi_query/aggregate.c"
-  "${GUFI_SRC}/gufi_query/external.c"       "${GUFI_SRC}/gufi_query/gqw.c"
+  "${GUFI_SRC}/gufi_query/external_attach.c" "${GUFI_SRC}/gufi_query/gqw.c"
   "${GUFI_SRC}/gufi_query/handle_sql.c"     "${GUFI_SRC}/gufi_query/process_queries.c"
   "${GUFI_SRC}/gufi_query/processdir.c"     "${GUFI_SRC}/gufi_query/query.c"
   "${GUFI_SRC}/gufi_query/query_replacement.c" "${GUFI_SRC}/gufi_query/query_user_strs.c"
