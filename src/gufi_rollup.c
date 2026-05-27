@@ -74,7 +74,7 @@ OF SUCH DAMAGE.
 #include "bf.h"
 #include "dbutils.h"
 #include "debug.h"
-#include "external.h"
+#include "external_attach.h"
 #include "template_db.h"
 #include "utils.h"
 
@@ -661,7 +661,7 @@ static int rollup_external_xattrs(void *args, int count, char **data, char **col
         }
 
         /* copy the template file */
-        if (copy_template(ca->xattr, xattr_db_name, uid, gid)) {
+        if (copy_template(ca->xattr, xattr_db_name, uid, gid, NULL)) {
             return 1;
         }
     }
@@ -902,7 +902,7 @@ static int rollup_ascend(void *args) {
     struct DirStats *ds = malloc(sizeof(struct DirStats));
     SNFORMAT_S(ds->path, MAXPATH, 1, dir->data.name, dir->data.name_len);
     ds->level = dir->data.level;
-    ds->subdir_count = dir->data.subdir_count;
+    ds->subdir_count = sll_get_size(&dir->data.subdirs);
     ds->subnondir_count = 0;
     ds->too_many_before = 0;
     ds->too_many_after = 0;
@@ -1019,7 +1019,7 @@ int main(int argc, char *argv[]) {
     process_args_and_maybe_exit(options, 1, "GUFI_tree ...", &pa.in);
 
     init_template_db(&pa.xattr_template);
-    if (create_xattrs_template(&pa.xattr_template) != 0) {
+    if (create_xattrs_template(&pa.xattr_template, NULL) != 0) {
         fprintf(stderr, "Could not create xattr template file\n");
         input_fini(&pa.in);
         return EXIT_FAILURE;

@@ -1,0 +1,112 @@
+# Basic Usage with ssh (2 copies of each path)
+$ gufi_query_multiple_remotes -E "SELECT rpath(sname, sroll, name) FROM vrpentries;" "gufi_vt" ssh --remote-cmd "ssh" remote1 "search" remote2 "search"
+prefix/.hidden
+prefix/.hidden
+prefix/1KB
+prefix/1KB
+prefix/1MB
+prefix/1MB
+prefix/directory/executable
+prefix/directory/executable
+prefix/directory/readonly
+prefix/directory/readonly
+prefix/directory/subdirectory/directory_symlink
+prefix/directory/subdirectory/directory_symlink
+prefix/directory/subdirectory/repeat_name
+prefix/directory/subdirectory/repeat_name
+prefix/directory/writable
+prefix/directory/writable
+prefix/file_symlink
+prefix/file_symlink
+prefix/leaf_directory/leaf_file1
+prefix/leaf_directory/leaf_file1
+prefix/leaf_directory/leaf_file2
+prefix/leaf_directory/leaf_file2
+prefix/old_file
+prefix/old_file
+prefix/repeat_name
+prefix/repeat_name
+prefix/unusual#? directory ,/unusual, name?#
+prefix/unusual#? directory ,/unusual, name?#
+
+# Modify Aggregated Results with ssh
+$ gufi_query_multiple_remotes -E "SELECT rpath(sname, sroll, name) AS fullpath FROM vrpentries;" --extra-sql "ORDER BY fullpath ASC LIMIT 3" "gufi_vt" ssh --remote-cmd "ssh" remote1 "search" remote2 "search"
+prefix/.hidden
+prefix/.hidden
+prefix/1KB
+
+# Basic Usage with pdsh (2 copies of each path)
+$ gufi_query_multiple_remotes -E "SELECT rpath(sname, sroll, name) FROM vrpentries;" "gufi_vt" pdsh --remote-cmd "pdsh" remote1 remote2 "search"
+prefix/.hidden
+prefix/.hidden
+prefix/1KB
+prefix/1KB
+prefix/1MB
+prefix/1MB
+prefix/directory/executable
+prefix/directory/executable
+prefix/directory/readonly
+prefix/directory/readonly
+prefix/directory/subdirectory/directory_symlink
+prefix/directory/subdirectory/directory_symlink
+prefix/directory/subdirectory/repeat_name
+prefix/directory/subdirectory/repeat_name
+prefix/directory/writable
+prefix/directory/writable
+prefix/file_symlink
+prefix/file_symlink
+prefix/leaf_directory/leaf_file1
+prefix/leaf_directory/leaf_file1
+prefix/leaf_directory/leaf_file2
+prefix/leaf_directory/leaf_file2
+prefix/old_file
+prefix/old_file
+prefix/repeat_name
+prefix/repeat_name
+prefix/unusual#? directory ,/unusual, name?#
+prefix/unusual#? directory ,/unusual, name?#
+
+# Modify Aggregated Results with pdsh
+$ gufi_query_multiple_remotes -E "SELECT rpath(sname, sroll, name) AS fullpath FROM vrpentries;" --extra-sql "ORDER BY fullpath ASC LIMIT 3" "gufi_vt" pdsh --remote-cmd "pdsh" remote1 remote2 "search"
+prefix/.hidden
+prefix/.hidden
+prefix/1KB
+
+# ssh with Verbose
+$ gufi_query_multiple_remotes -E "SELECT rpath(sname, sroll, name) AS fullpath FROM vrpentries;" --extra-sql "ORDER BY fullpath ASC LIMIT 1" --verbose "gufi_vt" ssh --remote-cmd "ssh" remote1 "search" remote2 "search"
+Each line is one argv[i]:
+    ssh \
+        remote1 \
+        gufi_query --print-tlv -x --threads 1 -E "SELECT rpath(sname, sroll, name) AS fullpath FROM vrpentries;" search
+Each line is one argv[i]:
+    ssh \
+        remote2 \
+        gufi_query --print-tlv -x --threads 1 -E "SELECT rpath(sname, sroll, name) AS fullpath FROM vrpentries;" search
+Aggregate results with:
+    SELECT * FROM (SELECT * FROM vt0 UNION ALL SELECT * FROM vt1) ORDER BY fullpath ASC LIMIT 1;
+
+prefix/.hidden
+
+# pdsh with Verbose
+$ gufi_query_multiple_remotes -E "SELECT rpath(sname, sroll, name) FROM vrpentries;" --extra-sql "LIMIT 1" --verbose "gufi_vt" pdsh --remote-cmd "pdsh" remote1 remote2 "search"
+Each line is one argv[i]:
+    pdsh \
+        -R \
+        ssh \
+        -w \
+        remote1,remote2 \
+        -N \
+        gufi_query --print-tlv -x --threads 1 -E "SELECT rpath(sname, sroll, name) FROM vrpentries;" search
+Aggregate results with:
+    SELECT * FROM vt LIMIT 1;
+
+prefix/.hidden
+
+# Bad ssh URI + Index Path Pair
+$ gufi_query_multiple_remotes -E "SELECT rpath(sname, sroll, name) AS fullpath FROM vrpentries;" --extra-sql "ORDER BY fullpath ASC LIMIT 1" --verbose "gufi_vt" ssh --remote-cmd "ssh" remote1 "search" remote2 2>&1 | grep "error:"
+gufi_query_multiple_remotes: error: Missing index path
+
+# Use flags to do nothing
+$ gufi_query_multiple_remotes -a 1 -I "" -T "" -S "" -E "" -K "" -J "" -G "" -F "" --external-attach "^$" "tab" "template.tab" "v" --external-copy "\^$" "SELECT 0;" --verbose "gufi_vt" ssh --remote-cmd "ssh" remote1 "search" remote2 "search" 2>&1 | grep "Error"
+sqlite3.OperationalError: Need at least one of T/S/E when not aggregating
+

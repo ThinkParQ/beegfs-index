@@ -80,7 +80,7 @@ if (CMAKE_BINARY_DIR STREQUAL CMAKE_INSTALL_PREFIX)
   message(FATAL_ERROR "Refusing to install into build directory \"${CMAKE_BINARY_DIR}\"")
 endif()
 
-project(GUFI VERSION 0.6.10 LANGUAGES C)
+project(GUFI VERSION 0.7.0 LANGUAGES C)
 
 # print version info
 find_package(Git)                     # not required
@@ -164,10 +164,9 @@ if(CMAKE_BUILD_TYPE STREQUAL "Debug")
   endif()
 endif()
 
-if (CYGWIN)
-  set(DEP_AI OFF)
-else()
-  set(DEP_AI ON CACHE BOOL "Whether or not to build and link with SQLite AI modules")
+set(DEP_AI ON CACHE BOOL "Whether or not to build and link with SQLite AI modules")
+if (DEP_AI)
+  message(STATUS "AI dependencies enabled")
 endif()
 
 # Only enable C++ if support is found or if llama.cpp is rquired
@@ -303,8 +302,8 @@ endif()
 # Need pthread
 find_package(Threads REQUIRED)
 
-# Need PCRE2 for linking only
 pkg_search_module(PCRE2 REQUIRED libpcre2-8)
+add_definitions(-DPCRE2_CODE_UNIT_WIDTH=8) # needed by external_copy.h
 set(CPACK_RPM_PACKAGE_REQUIRES "${CPACK_RPM_PACKAGE_REQUIRES}, pcre2")
 
 # Download and build all non-system dependencies
@@ -348,6 +347,9 @@ if (DEP_USE_JEMALLOC)
 endif()
 if (DEP_AI)
   set(DEP_OPTIONS ${DEP_OPTIONS} --AI)
+  if (CYGWIN)
+    set(DEP_OPTIONS ${DEP_OPTIONS} --cygwin --OMP "-DOpenMP_C_FLAGS=\"${OpenMP_C_FLAGS}\" -DOpenMP_C_LIB_NAMES=\"${OpenMP_C_LIB_NAMES}\" -DOpenMP_libgomp_LIBRARY=\"${OpenMP_libgomp_LIBRARY}\"")
+  endif()
 endif()
 add_custom_target(install_dependencies ALL COMMAND ${CMAKE_SOURCE_DIR}/contrib/deps/install_deps.sh ${DEP_OPTIONS} "${DEP_DOWNLOAD_PREFIX}" "${DEP_BUILD_PREFIX}" "${DEP_INSTALL_PREFIX}" "${CMAKE_VERSION}" "${CMAKE_SYSTEM_NAME}")
 
@@ -407,15 +409,15 @@ endif()
 # Find GPFS
 find_library(GPFS_LIB gpfs PATH "/usr/lpp/mmfs/lib")
 if (GPFS_LIB)
-  message(STATUS "GPFS libraries found; building gpfs-scan-tool")
+  message(STATUS "GPFS libraries found")
   option(GPFS_BUILD "Build GPFS GUFI tools" ON)
   if (GPFS_BUILD)
     set(CPACK_RPM_PACKAGE_REQUIRES "${CPACK_RPM_PACKAGE_REQUIRES}, gpfs.base")
   else()
-    message(STATUS "GPFS libraries found but not building gpfs-scan-tool")
+    message(STATUS "GPFS libraries found but not building gpfs code")
   endif()
 else()
-  message(STATUS "GPFS libraries not found; not building gpfs-scan-tool")
+  message(STATUS "GPFS libraries not found; not building gpfs code")
 endif()
 
 # Find DB2
@@ -437,6 +439,7 @@ endif()
 set(COMMON_INCLUDES
   ${CMAKE_SOURCE_DIR}/include
   ${XATTR_INCLUDEDIR}
+  ${PCRE2_INCLUDEDIR}
   "${DEP_INSTALL_PREFIX}/sqlite3/include"
   "${DEP_INSTALL_PREFIX}/sqlite3-pcre"
 )
@@ -468,9 +471,15 @@ if (DEP_AI)
   list(APPEND COMMON_LIBRARIES
     "${DEP_INSTALL_PREFIX}/sqlite-vec/lib/libsqlite_vec0.a"
     "${DEP_INSTALL_PREFIX}/sqlite-lembed/lib/libsqlite_lembed0.a"
-    -L"${DEP_INSTALL_PREFIX}/llama.cpp/lib" llama -lstdc++ ${OpenMP_C_FLAGS}
+    -L"${DEP_INSTALL_PREFIX}/llama.cpp/lib" llama ggml-cpu ggml-base ggml ${OpenMP_C_FLAGS}
     -L"${DEP_INSTALL_PREFIX}/sqlite3/lib" sqlite3 # only needed to make sure definitions exist - not actually linked?
-  )
+    )
+
+  if (CMAKE_C_COMPILER_ID STREQUAL "Clang")
+    list(APPEND COMMON_LIBRARIES
+      omp
+    )
+  endif()
 endif()
 
 if (ZLIB_FOUND)
@@ -482,6 +491,7 @@ endif()
 if (DEP_USE_JEMALLOC)
   list(APPEND COMMON_LIBRARIES
     "${JEMALLOC}"
+    stdc++ # required by alpine linux
   )
 endif()
 
@@ -545,11 +555,11 @@ add_subdirectory(scripts)
 # build documentation
 add_subdirectory(docs)
 
-# recurse down into the test subdirectory
-add_subdirectory(test)
-
 # build contrib executables
 add_subdirectory(contrib)
+
+# recurse down into the test subdirectory
+add_subdirectory(test)
 
 # copy examples
 add_subdirectory(examples)
@@ -576,7 +586,10 @@ if (RPMBUILD)
 
   set(CPACK_GENERATOR "RPM")
   set(CPACK_RPM_COMPONENT_INSTALL On)
-  set(CPACK_RPM_FILE_NAME "gufi-${GUFI_VERSION}.${ARCH}.rpm")
+  set(CPACK_COMPONENTS_ALL Server)
+  if (CLIENT)
+    list(APPEND CPACK_COMPONENTS_ALL Client)
+  endif()
   set(CPACK_RPM_PACKAGE_AUTOREQ Off)
   set(CPACK_RPM_PACKAGE_SUMMARY "Grand Unified File Index")
   set(CPACK_RPM_PACKAGE_NAME "GUFI")

@@ -76,6 +76,8 @@ SQLITE_EXTENSION_INIT1
 #include "addqueryfuncs.h"
 #include "bf.h"
 #include "dbutils.h"
+#include "external_attach.h"
+#include "external_copy.h"
 #include "popen_argv.h"
 #include "print.h"
 #include "utils.h"
@@ -104,22 +106,15 @@ SQLITE_EXTENSION_INIT1
  * See the respective comments below for details.
  */
 
-typedef struct {
-    str_t basename;
-    str_t table;
-    str_t template;
-    str_t view;
-} extdb_t;
-
 typedef struct gufi_query_cmd {
-    str_t remote_cmd;   /* command to send this run to a remote host (i.e. ssh); prefixes gufi_query command */
-    sll_t remote_args;  /* list of str_t that are single arguments to remote_cmd (i.e. user@remote) */
-    int verbose;        /* print gufi_query command */
+    str_t remote_cmd;         /* command to send this run to a remote host (i.e. ssh); prefixes gufi_query command */
+    sll_t remote_args;        /* list of str_t that are single arguments to remote_cmd (i.e. user@remote) */
+    int verbose;              /* print gufi_query command */
 
-    str_t threads;      /* number of threads in string form to avoid converting back and forth */
-    str_t a;            /* gufi_query -a <0|1|2> */
-    str_t min_level;    /* defaults to 0; set to non-0 if index root should be used with path list */
-    str_t max_level;    /* defaults to (uint64_t) -1 */
+    str_t threads;            /* number of threads in string form to avoid converting back and forth */
+    str_t a;                  /* gufi_query -a <0|1|2> */
+    str_t min_level;          /* defaults to 0; set to non-0 if index root should be used with path list */
+    str_t max_level;          /* defaults to (uint64_t) -1 */
     str_t dir_match_uid;
     int dir_match_uid_set;
     str_t dir_match_gid;
@@ -142,13 +137,14 @@ typedef struct gufi_query_cmd {
     str_t G;
     str_t F;
 
-    str_t path_list;    /* list of paths to process; if min-level is 0, these should be full paths/relative to pwd */
-    str_t p;            /* source path */
-    sll_t plugins;      /* gufi_query plugin library paths */
+    str_t path_list;          /* list of paths to process; if min-level is 0, these should be full paths/relative to pwd */
+    str_t p;                  /* source path */
+    sll_t plugins;            /* gufi_query plugin library paths */
 
-    sll_t extdbs;       /* list of external database args */
+    sll_t external_attach;    /* list of external attach database args */
+    sll_t external_copy;      /* list of external copy database args */
 
-    sll_t indexroots;   /* list of index roots to pass to gufi_query */
+    sll_t indexroots;         /* list of index roots to pass to gufi_query */
 } gq_cmd_t;
 
 static void gq_cmd_init(gq_cmd_t *cmd) {
@@ -156,14 +152,16 @@ static void gq_cmd_init(gq_cmd_t *cmd) {
     sll_init(&cmd->remote_args);
     sll_init(&cmd->plugins);
     sll_init(&cmd->indexroots);
-    sll_init(&cmd->extdbs);
+    sll_init(&cmd->external_attach);
+    sll_init(&cmd->external_copy);
 }
 
 static void gq_cmd_destroy(gq_cmd_t *cmd) {
-    sll_destroy(&cmd->extdbs, free);      /* list of allocated extdb_t */
-    sll_destroy(&cmd->indexroots, NULL);  /* list of references to argv[i] */
-    sll_destroy(&cmd->plugins, NULL);     /* list of references to argv[i] */
-    sll_destroy(&cmd->remote_args, free); /* list of allocated str_t */
+    sll_destroy(&cmd->external_copy, ecs_free);    /* list of allocated ecs_t */
+    sll_destroy(&cmd->external_attach, free);      /* list of allocated eas_t */
+    sll_destroy(&cmd->indexroots, NULL);           /* list of references to argv[i] */
+    sll_destroy(&cmd->plugins, NULL);              /* list of references to argv[i] */
+    sll_destroy(&cmd->remote_args, free);          /* list of allocated str_t */
     /* not freeing cmd here */
 }
 
@@ -173,17 +171,33 @@ typedef struct gufi_vtab {
     int fixed_schema;      /* fixed schema (gufi_vt_*) or not (gufi_vt)? */
 } gufi_vtab;
 
+struct column {
+    size_t start;          /* offset to where entire column's formatted string starts */
+    size_t len;            /* length of column data only (no prefix) */
+    size_t data;           /* offset to where column data is */
+};
+
 typedef struct gufi_vtab_cursor {
     sqlite3_vtab_cursor base;
 
     popen_argv_t *output;
     char *row;             /* current row */
     size_t len;            /* length of current row */
-    size_t *col_starts;
     int col_count;
+    struct column *cols;
 
     sqlite_int64 rowid;    /* current row id */
 } gufi_vtab_cursor;
+
+/* cleanup only - not freeing pCur */
+static void gufi_vtab_cursor_fini(gufi_vtab_cursor *pCur) {
+    free(pCur->cols);
+    pCur->cols = NULL;
+    pCur->col_count =0;
+    pCur->len = 0;
+    free(pCur->row);
+    pCur->row = NULL;
+}
 
 static const char ONE_THREAD[] = "1";
 
@@ -222,8 +236,12 @@ static int gufi_query(const gq_cmd_t *cmd, popen_argv_t **output, char **errmsg)
                           "--print-tlv ");
         write_with_resize(&flat, &size, &len,
                           "-x ");
-        write_with_resize(&flat, &size, &len,
-                          "--threads %s ",                cmd->threads.data);
+
+        /* no quotes around thread count */
+        if (cmd->threads.data && cmd->threads.len) {
+            write_with_resize(&flat, &size, &len,
+                              "--threads %s ", cmd->threads.data);
+        }
 
         /* flatten the entire gufi_query command into a single string */
         #define flatten_argv(argc, argv, flag, refstr)               \
@@ -274,14 +292,22 @@ static int gufi_query(const gq_cmd_t *cmd, popen_argv_t **output, char **errmsg)
                               "--plugin '%s' ", plugin);
         }
 
-        sll_loop(&cmd->extdbs, node) {
-            extdb_t *extdb = (extdb_t *) sll_node_data(node);
+        sll_loop(&cmd->external_attach, node) {
+            eas_t *eas = (eas_t *) sll_node_data(node);
             write_with_resize(&flat, &size, &len,
-                              "-Q '%s' '%s' '%s' '%s' ",
-                              extdb->basename.data,
-                              extdb->table.data,
-                              extdb->template.data,
-                              extdb->view.data);
+                              "--external-attach '%s' '%s' '%s' '%s' ",
+                              eas->basename.data,
+                              eas->table.data,
+                              eas->template_table.data,
+                              eas->view.data);
+        }
+
+        sll_loop(&cmd->external_copy, node) {
+            ecs_t *ecs = (ecs_t *) sll_node_data(node);
+            write_with_resize(&flat, &size, &len,
+                              "--external-copy '%s' '%s' ",
+                              ecs->basename_pattern.data,
+                              ecs->sql.data);
         }
 
         sll_loop(&cmd->indexroots, node) {
@@ -295,9 +321,10 @@ static int gufi_query(const gq_cmd_t *cmd, popen_argv_t **output, char **errmsg)
     else {
         /* can keep arguments separate */
 
-        max_argc = 35; /* 5 fixed args, 14 pairs of flags, 2 single argv flags */
+        max_argc = 35; /* 3 fixed args, 15 pairs of flags, 2 single argv flags */
         max_argc += sll_get_size(&cmd->plugins) * 2;
-        max_argc += sll_get_size(&cmd->extdbs) * 5;
+        max_argc += sll_get_size(&cmd->external_attach) * 5;
+        max_argc += sll_get_size(&cmd->external_copy) * 3;
         max_argc += sll_get_size(&cmd->indexroots);
 
         argv = calloc(max_argc + 1, sizeof(argv[0]));
@@ -306,16 +333,13 @@ static int gufi_query(const gq_cmd_t *cmd, popen_argv_t **output, char **errmsg)
         argv[argc++] = "--print-tlv";
         argv[argc++] = "-x";
 
-        /* keep this immediately before other key-value flags to make printing easier */
-        argv[argc++] ="--threads";
-        argv[argc++] = cmd->threads.data; /* always set */
-
         #define set_argv(argc, argv, flag, refstr)  \
             if (refstr.len) {                       \
                 argv[argc++] = flag;                \
                 argv[argc++] = refstr.data;         \
             }
 
+        set_argv(argc, argv, "--threads",   cmd->threads);
         set_argv(argc, argv, "-a",          cmd->a);
 
         /* construct the rest of the gufi_query command */
@@ -370,13 +394,20 @@ static int gufi_query(const gq_cmd_t *cmd, popen_argv_t **output, char **errmsg)
             argv[argc++] = plugin;
         }
 
-        sll_loop(&cmd->extdbs, node) {
-            extdb_t *extdb = (extdb_t *) sll_node_data(node);
-            argv[argc++] = "-Q";
-            argv[argc++] = extdb->basename.data;
-            argv[argc++] = extdb->table.data;
-            argv[argc++] = extdb->template.data;
-            argv[argc++] = extdb->view.data;
+        sll_loop(&cmd->external_attach, node) {
+            eas_t *eas = (eas_t *) sll_node_data(node);
+            argv[argc++] = "--external-attach";
+            argv[argc++] = eas->basename.data;
+            argv[argc++] = eas->table.data;
+            argv[argc++] = eas->template_table.data;
+            argv[argc++] = eas->view.data;
+        }
+
+        sll_loop(&cmd->external_copy, node) {
+            ecs_t *ecs = (ecs_t *) sll_node_data(node);
+            argv[argc++] = "--external-copy";
+            argv[argc++] = ecs->basename_pattern.data;
+            argv[argc++] = ecs->sql.data;
         }
 
         sll_loop(&cmd->indexroots, node) {
@@ -416,52 +447,32 @@ static int gufi_query(const gq_cmd_t *cmd, popen_argv_t **output, char **errmsg)
     return SQLITE_OK;
 }
 
-/* wait for and read the first few octets of output */
-static int gufi_query_read_tlv_header(gufi_vtab_cursor *pCur) {
-    const int fd = popen_argv_fd(pCur->output);
-
-    char tlv_prefix[sizeof(TLV_PREFIX)];
-
-    /* read the first few octets */
-    if (read_size(fd, &tlv_prefix, sizeof(tlv_prefix)) != sizeof(tlv_prefix)) {
-        /* not setting zErrMsg - SQL logic error makes more sense for users */
-        return -1;
-    }
-
-    /* see if it is the expected header */
-    if (strncmp(tlv_prefix, TLV_PREFIX, sizeof(TLV_PREFIX)) != 0) {
-        /* probably got the help menu */
-        /* not setting zErrMsg - SQL logic error makes more sense for users */
-        return -1;
-    }
-
-    return 0;
-}
-
-/* space taken up by type and length */
-static const size_t TL = sizeof(char) + sizeof(size_t);
+/* space taken up by type and length of length */
+static const size_t TLoL = sizeof(char) + sizeof(char);
 
 /* read TLV rows terminated by newline - this only works because type is in the range [1, 5] */
 static int gufi_query_read_row(gufi_vtab_cursor *pCur) {
     size_t row_len = 0;
-    int count = 0;
-    static const size_t ROW_PREFIX = sizeof(row_len) + sizeof(count);
+    int col_count = 0;
+
+    #define ROW_PREFIX_LEN TLV_ROW_LEN_LEN + TLV_COL_COUNT_LEN
 
     char *buf = NULL;
     char *curr = buf;
-    size_t *starts = NULL;    /* index of where each column starts in buf */
+    struct column *cols = NULL;
 
     const int fd = popen_argv_fd(pCur->output);
 
-    /* row length */
-    switch (read_size(fd, &row_len, sizeof(row_len))) {
-        case sizeof(row_len): /* good */
+    char row_prefix[ROW_PREFIX_LEN + 1] = {0};
+
+    switch (read_size(fd, row_prefix, ROW_PREFIX_LEN)) {
+        case ROW_PREFIX_LEN:  /* good */
             break;
         case -1:              /* error */
-        default:              /* not sizeof(row_len) */
+        default:              /* not ROW_PREFIX_LEN */
             {
                 const int err = errno;
-                pCur->base.pVtab->zErrMsg = sqlite3_mprintf("Error: Could not read row length: %s (%d)",
+                pCur->base.pVtab->zErrMsg = sqlite3_mprintf("Error: Could not read row prefix: %s (%d)",
                                                             strerror(err), err);
             }
             /* fallthrough */
@@ -470,64 +481,100 @@ static int gufi_query_read_row(gufi_vtab_cursor *pCur) {
             goto error;
     }
 
-    /* column count */
-    if (read_size(fd, &count, sizeof(count)) != sizeof(count)) {
+    /* size_t row length */
+    if (sscanf(row_prefix, TLV_ROW_LEN_READ_FMT, &row_len) != 1) {
         const int err = errno;
-        pCur->base.pVtab->zErrMsg = sqlite3_mprintf("Error: Could not read column count: %s (%d)",
-                                                    strerror(err), err);
+        pCur->base.pVtab->zErrMsg = sqlite3_mprintf("Error: Could not parse row length from \"%.*s\": %s (%d)",
+                                                    TLV_ROW_LEN_LEN, row_prefix, strerror(err), err);
         goto error;
     }
 
-    row_len -= ROW_PREFIX;
+    /* int column count */
+    if (sscanf(row_prefix + TLV_ROW_LEN_LEN, TLV_COL_COUNT_READ_FMT, (unsigned int *) &col_count) != 1) {
+        const int err = errno;
+        pCur->base.pVtab->zErrMsg = sqlite3_mprintf("Error: Could not parse column count from \"%s\": %s (%d)",
+                                                    row_prefix + TLV_ROW_LEN_LEN, strerror(err), err);
+        goto error;
+    }
+
+    row_len -= ROW_PREFIX_LEN;
 
     /* read the entire row into buf */
     /* buf does not contain row prefix */
     buf = malloc(row_len + 1); /* allow for NULL terminator */
     curr = buf;
-    starts = malloc(count * sizeof(size_t));
+    cols = malloc(col_count * sizeof(*cols));
 
-    for(int i = 0; i < count; i++) {
+    for(int i = 0; i < col_count; i++) {
         /* column start points to type */
-        starts[i] = curr - buf;
+        cols[i].start = curr - buf;
 
-        /* read type and length */
-        const size_t tl = read_size(fd, curr, TL);
-        if (tl != TL) {
+        /* read type and length of length */
+        const size_t tlol = read_size(fd, curr, TLoL);
+        if (tlol != TLoL) {
             const int err = errno;
-            pCur->base.pVtab->zErrMsg = sqlite3_mprintf("Error: Could not read type and length from column %d: %s (%d)",
+            pCur->base.pVtab->zErrMsg = sqlite3_mprintf("Error: Could not read type and length of column length %d: %s (%d)",
+                                                        i, strerror(err), err);
+            goto error;
+        }
+        *curr -= '0';                /* remove '0' from the type char */
+
+        curr++;                      /* move to length of length */
+        const char len_of_len = *curr - '0';
+
+        curr++;                      /* move to length */
+
+        /* read length */
+        if (read_size(fd, curr, len_of_len) != len_of_len) {
+            const int err = errno;
+            pCur->base.pVtab->zErrMsg = sqlite3_mprintf("Error: Could not read length of column %d: %s (%d)",
                                                         i, strerror(err), err);
             goto error;
         }
 
-        const size_t value_len = * (size_t *) (curr + sizeof(char));
+        /*
+         * NULL terminate for sscanf()
+         *
+         * no need to restore char that was NULL terminated
+         * because those chars have not been read yet
+         */
+        *(curr + len_of_len) = '\0';
 
-        curr += TL;   /* to go to start of value */
-
-        const size_t v = read_size(fd, curr, value_len);
-        if (v != value_len) {
+        /* parse length */
+        if (sscanf(curr, TLV_COL_LEN_READ_FMT, &cols[i].len) != 1) {
             const int err = errno;
-            pCur->base.pVtab->zErrMsg = sqlite3_mprintf("Error: Could not read %zu octets. Got %zu: %s (%d)",
-                                                        value_len, v, strerror(err), err);
+            pCur->base.pVtab->zErrMsg = sqlite3_mprintf("Error: Could not parse length of column %d from \"%s\": %s (%d)",
+                                                        i, curr, strerror(err), err);
             goto error;
         }
 
-        curr += value_len;
+        curr += len_of_len;          /* to go to start of value */
+
+        const size_t v = read_size(fd, curr, cols[i].len);
+        if (v != cols[i].len) {
+            const int err = errno;
+            pCur->base.pVtab->zErrMsg = sqlite3_mprintf("Error: Could not read %zu octets. Got %zu: %s (%d)",
+                                                        cols[i].len, v, strerror(err), err);
+            goto error;
+        }
+
+        /* offset from column start, not row start */
+        cols[i].data = curr - buf - cols[i].start;
+
+        curr += cols[i].len;
     }
 
     pCur->row = buf;
     pCur->len = row_len;
-    pCur->col_starts = starts;
-    pCur->col_count = count;
+    pCur->col_count = col_count;
+    pCur->cols = cols;
 
     return 0;
 
   error:
-    free(starts);
-    pCur->col_starts = NULL;
-    pCur->col_count = 0;
+    free(cols);
     free(buf);
-    pCur->row = NULL;
-    pCur->len = 0;
+    gufi_vtab_cursor_fini(pCur);
     return 1;
 }
 
@@ -570,7 +617,7 @@ static int gufi_vtConnect(sqlite3 *db, void *pAux,
 
     gufi_vtab *pNew = NULL;
     const int rc = sqlite3_declare_vtab(db, schema);
-    if(rc == SQLITE_OK){
+    if (rc == SQLITE_OK) {
         pNew = (gufi_vtab *)sqlite3_malloc( sizeof(*pNew) );
         if( pNew==0 ) return SQLITE_NOMEM;
         memset(pNew, 0, sizeof(*pNew));
@@ -815,6 +862,8 @@ gufi_vt_xConnect(VRPENTRIES,  VRP, 0, 0, 1, 1)
  *     F                       = '<SQL>'
  *     path_list               = '<file path>'
  *     p                       = '<source path for use with spath()>'
+ *     Q or external_attach    = '<basename> <table> <template>.<table> <view>'
+ *     external_copy           = '<basename pattern> <SQL>'
  *     plugin                  = '<entrypoint>:<gufi_query plugin library path>'
  *     index                   = '<path>' (can also pass in without the key)
  *     verbose/VERBOSE         =  <0|1>
@@ -830,6 +879,8 @@ gufi_vt_xConnect(VRPENTRIES,  VRP, 0, 0, 1, 1)
  *           - The following are exceptions and all values will be used in the order they appear:
  *                 - remote_arg
  *                 - plugin
+ *                 - Q or external_attach
+ *                 - external_copy
  *                 - index
  *     - At least one of T, S, or E must be passed in
  *     - When determining the virtual table's schema, there are two separate cases:
@@ -922,7 +973,7 @@ static int get_cols(sqlite3 *db, str_t *sql, int **types,
 }
 
 /* parse Q='<basename> <table> <template.table> <view>' */
-static int parse_extdb(sll_t *extdbs, char *arg) {
+static int parse_external_attach_args(sll_t *external_attach, char *arg) {
     char *saveptr  = NULL;
     char *basename = strtok_r(arg,  " ", &saveptr);
     char *table    = strtok_r(NULL, " ", &saveptr);
@@ -933,13 +984,36 @@ static int parse_extdb(sll_t *extdbs, char *arg) {
         return -1;
     }
 
-    extdb_t *extdb = calloc(1, sizeof(*extdb));
-    set_refstr(&extdb->basename, basename);
-    set_refstr(&extdb->table,    table);
-    set_refstr(&extdb->template, template);
-    set_refstr(&extdb->view,     view);
+    eas_t *eas = calloc(1, sizeof(*eas));
+    set_refstr(&eas->basename,       basename);
+    set_refstr(&eas->table,          table);
+    set_refstr(&eas->template_table, template);
+    set_refstr(&eas->view,           view);
 
-    sll_push_back(extdbs, extdb);
+    sll_push_back(external_attach, eas);
+
+    return 0;
+}
+
+/* parse external_copy='<basename pattern> <SQL>' */
+static int parse_external_copy_args(sll_t *external_copy, char *arg) {
+    char *sql              = NULL;
+    char *basename_pattern = strtok_r(arg,  " ", &sql);
+
+    if (!basename_pattern || !sql) {
+        return -1;
+    }
+
+    ecs_t *ecs = calloc(1, sizeof(*ecs));
+    set_refstr(&ecs->basename_pattern, basename_pattern);
+    set_refstr(&ecs->sql,              sql);
+
+    if (!ecs->basename_pattern.len || !ecs->sql.len) {
+        free(ecs);
+        return -1;
+    }
+
+    sll_push_back(external_copy, ecs);
 
     return 0;
 }
@@ -1012,8 +1086,8 @@ static int gufi_vtpu_xConnect(sqlite3 *db,
                     set_refstr(&cmd.p, value);
                     break;
                 case 'Q':
-                    if (parse_extdb(&cmd.extdbs, value) != 0) {
-                        *pzErr = sqlite3_mprintf("Bad external database args");
+                    if (parse_external_attach_args(&cmd.external_attach, value) != 0) {
+                        *pzErr = sqlite3_mprintf("Bad external attach database args");
                         gq_cmd_destroy(&cmd);
                         return SQLITE_MISUSE;
                     }
@@ -1077,6 +1151,20 @@ static int gufi_vtpu_xConnect(sqlite3 *db,
             set_refstr(&cmd.dir_match_gid, value);
             cmd.dir_match_gid_set = 1;
         }
+        else if (strncmp(key, "external_copy", 14) == 0) {
+            if (parse_external_copy_args(&cmd.external_copy, value) != 0) {
+                *pzErr = sqlite3_mprintf("Bad external copy database args");
+                gq_cmd_destroy(&cmd);
+                return SQLITE_MISUSE;
+            }
+        }
+        else if (strncmp(key, "external_attach", 16) == 0) {
+            if (parse_external_attach_args(&cmd.external_attach, value) != 0) {
+                *pzErr = sqlite3_mprintf("Bad external attach database args");
+                gq_cmd_destroy(&cmd);
+                return SQLITE_MISUSE;
+            }
+        }
         else if (strncmp(key, "setup_res_col_type", 19) == 0) {
             set_refstr(&cmd.setup_res_col_type, value);
         }
@@ -1112,6 +1200,7 @@ static int gufi_vtpu_xConnect(sqlite3 *db,
     if (plugins_global_init(&in.plugins, &in) != in.plugins.count) {
         plugins_destroy(&in.plugins);
         gq_cmd_destroy(&cmd);
+        input_fini(&in);
         return SQLITE_CONSTRAINT;
     }
 
@@ -1230,6 +1319,7 @@ static int gufi_vtpu_xConnect(sqlite3 *db,
     plugins_destroy(&in.plugins);
 
     closedb(tempdb);
+    input_fini(&in);
 
     return gufi_vtConnect(db, pAux, argc, argv, ppVtab, pzErr,
                           schema, &cmd, 0);
@@ -1241,6 +1331,7 @@ static int gufi_vtpu_xConnect(sqlite3 *db,
     plugins_destroy(&in.plugins);
 
     closedb(tempdb);
+    input_fini(&in);
     gq_cmd_destroy(&cmd);
     return SQLITE_ERROR;
 }
@@ -1306,10 +1397,7 @@ static int gufi_vtOpen(sqlite3_vtab *p, sqlite3_vtab_cursor **ppCursor) {
 
 static int gufi_vtClose(sqlite3_vtab_cursor *cur) {
     gufi_vtab_cursor *pCur = (gufi_vtab_cursor *) cur;
-    free(pCur->col_starts);
-    pCur->col_starts = NULL;
-    free(pCur->row);
-    pCur->row = NULL;
+    gufi_vtab_cursor_fini(pCur);
     sqlite3_free(cur);
     return SQLITE_OK;
 }
@@ -1424,15 +1512,18 @@ static int gufi_vtFilter(sqlite3_vtab_cursor *cur,
     pCur->row = NULL;
     pCur->len = 0;
 
-    /* wait for header */
-    if (gufi_query_read_tlv_header(pCur) != 0) {
-        gufi_vtEof(cur);
-        return SQLITE_ERROR;
-    }
-
-    /* if the header is good, read the first line */
+    /* wait for the first line */
     if (gufi_query_read_row(pCur) != 0) {
-        gufi_vtEof(cur);
+        const int ret = popen_argv_close(pCur->output);
+        pCur->output = NULL;
+        sqlite3_free(vtab->base.zErrMsg);
+        vtab->base.zErrMsg = NULL;
+
+        /* gufi_query returned non-zero value */
+        if (ret) {
+            return SQLITE_ERROR;
+        }
+
         /* not an error - got 0 rows */
     }
 
@@ -1441,20 +1532,10 @@ static int gufi_vtFilter(sqlite3_vtab_cursor *cur,
 
 static int gufi_vtNext(sqlite3_vtab_cursor *cur) {
     gufi_vtab_cursor *pCur = (gufi_vtab_cursor *) cur;
+    gufi_vtab_cursor_fini(pCur);
 
-    free(pCur->row);
-    pCur->row = NULL;
-    pCur->len = 0;
-    free(pCur->col_starts);
-    pCur->col_starts = NULL;
-    pCur->col_count = 0;
-
-    /* no more to read or error */
-    if (gufi_query_read_row(pCur) != 0) {
-        return SQLITE_OK;
-    }
-
-    pCur->rowid++;
+    /* if no more to read or error, don't increment rowid */
+    pCur->rowid += (gufi_query_read_row(pCur) == 0);
 
     return SQLITE_OK;
 }
@@ -1462,7 +1543,7 @@ static int gufi_vtNext(sqlite3_vtab_cursor *cur) {
 static int gufi_vtEof(sqlite3_vtab_cursor *cur) {
     gufi_vtab_cursor *pCur = (gufi_vtab_cursor *) cur;
 
-    const int eof = (pCur->len <= sizeof(int));
+    const int eof = (pCur->len == 0);
     if (eof) {
         popen_argv_close(pCur->output);
         pCur->output = NULL;
@@ -1489,47 +1570,50 @@ static int gufi_vtColumn(sqlite3_vtab_cursor *cur,
         return SQLITE_OK;
     }
 
-    const char *buf = pCur->row + pCur->col_starts[N - (pVtab->fixed_schema?GUFI_VT_ARGS_COUNT:0)];
+    const size_t idx = N - (pVtab->fixed_schema?GUFI_VT_ARGS_COUNT:0);
+
+    struct column *col = &pCur->cols[idx];
+    const char *buf = pCur->row + col->start;
     const char type = *buf;
-    const size_t len = * (size_t *) (buf + 1);
-    const char *col = buf + TL;
+    const size_t len = col->len;
+    const char *value = buf + col->data;
 
     switch(type) {
         case SQLITE_INTEGER:
             {
-                const char orig = col[len];
-                ((char *)col)[len] = '\0';
+                const char orig = value[len];
+                ((char *)value)[len] = '\0';
 
-                int64_t value = 0;
-                if (sscanf(col, "%" PRId64, &value) == 1) {
-                    sqlite3_result_int64(ctx, value);
+                int64_t val = 0;
+                if (sscanf(value, "%" PRId64, &val) == 1) {
+                    sqlite3_result_int64(ctx, val);
                 }
                 else {
-                    sqlite3_result_text(ctx, col, len, SQLITE_TRANSIENT);
+                    sqlite3_result_text(ctx, value, len, SQLITE_TRANSIENT);
                 }
-                ((char *)col)[len] = orig;
+                ((char *)value)[len] = orig;
             }
             break;
         case SQLITE_FLOAT:
             {
-                double value = 0;
-                if (sscanf(col, "%lf", &value) == 1) {
-                    sqlite3_result_double(ctx, value);
+                double val = 0;
+                if (sscanf(value, "%lf", &val) == 1) {
+                    sqlite3_result_double(ctx, val);
                 }
                 else {
-                    sqlite3_result_text(ctx, col, len, SQLITE_TRANSIENT);
+                    sqlite3_result_text(ctx, value, len, SQLITE_TRANSIENT);
                 }
             }
             break;
         case SQLITE_TEXT:
-            sqlite3_result_text(ctx, col, len, SQLITE_TRANSIENT);
+            sqlite3_result_text(ctx, value, len, SQLITE_TRANSIENT);
             break;
         case SQLITE_BLOB:
-            sqlite3_result_blob(ctx, col, len, SQLITE_TRANSIENT);
+            sqlite3_result_blob(ctx, value, len, SQLITE_TRANSIENT);
             break;
         case SQLITE_NULL:
         default:
-            sqlite3_result_text(ctx, col, len, SQLITE_TRANSIENT);
+            sqlite3_result_text(ctx, value, len, SQLITE_TRANSIENT);
             break;
     }
 
