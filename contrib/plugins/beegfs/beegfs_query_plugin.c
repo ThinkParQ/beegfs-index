@@ -36,6 +36,11 @@ static inline long double ns_to_s(const uint64_t ns) {
 static int global_init(void *global) {
     struct input *in = (struct input *) global;
     beegfs_query_timing.enabled = in && in->terse;
+
+    if (sqlite3_initialize() != SQLITE_OK) {
+        return 1;
+    }
+
     return 0;
 }
 
