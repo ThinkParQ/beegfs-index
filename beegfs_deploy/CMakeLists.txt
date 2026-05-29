@@ -207,7 +207,10 @@ foreach(_plugin beegfs_index_plugin beegfs_query_plugin)
   add_library(${_plugin} SHARED "${BEEGFS_SRC}/${_plugin}.c" "${BEEGFS_SRC}/beegfs_plugin_shared.c")
   add_dependencies(${_plugin} install_dependencies)
   target_link_libraries(${_plugin} "${DEP_INSTALL_PREFIX}/sqlite3/lib/libsqlite3.${EXT}")
-  set_target_properties(${_plugin} PROPERTIES INSTALL_RPATH "$ORIGIN")
+  set_target_properties(${_plugin} PROPERTIES
+    BUILD_WITH_INSTALL_RPATH FALSE
+    INSTALL_RPATH "$ORIGIN"
+    BUILD_RPATH "${DEP_INSTALL_PREFIX}/sqlite3/lib")
   install(TARGETS ${_plugin} DESTINATION lib)
 endforeach()
 

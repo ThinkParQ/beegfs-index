@@ -25,5 +25,9 @@ elseif(CYGWIN)
 else()
   foreach(BEEGFS_PLUGIN ${BEEGFS_PLUGINS})
     target_link_libraries(${BEEGFS_PLUGIN} "${DEP_INSTALL_PREFIX}/sqlite3/lib/libsqlite3.${EXT}")
+    set_target_properties(${BEEGFS_PLUGIN} PROPERTIES
+      BUILD_WITH_INSTALL_RPATH FALSE
+      INSTALL_RPATH "$ORIGIN"
+      BUILD_RPATH "${DEP_INSTALL_PREFIX}/sqlite3/lib")
   endforeach()
 endif()
