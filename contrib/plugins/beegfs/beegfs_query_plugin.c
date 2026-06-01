@@ -24,6 +24,11 @@ static void *ctx_init(void *ptr) {
     return NULL;
 }
 
+static void global_exit(void *global) {
+    (void) global;
+    sqlite3_shutdown();
+}
+
 struct plugin_operations beegfs_query_ops = {
     .type = PLUGIN_QUERY,
     .global_init = global_init,
@@ -31,5 +36,5 @@ struct plugin_operations beegfs_query_ops = {
     .process_dir = NULL,
     .process_file = NULL,
     .ctx_exit = NULL,
-    .global_exit = NULL,
+    .global_exit = global_exit,
 };

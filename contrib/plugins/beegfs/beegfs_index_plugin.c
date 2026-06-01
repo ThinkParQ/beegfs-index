@@ -48,6 +48,11 @@ static void beegfs_index_state_destroy(struct beegfs_index_state *state) {
     free(state);
 }
 
+static int global_init(void *global) {
+    (void) global;
+    return sqlite3_initialize() == SQLITE_OK ? 0 : 1;
+}
+
 static void *ctx_init(void *ptr) {
     PCS_t *pcs = (PCS_t *) ptr;
     if (!pcs || !pcs->db || !pcs->work) {
@@ -103,12 +108,17 @@ static void ctx_exit(void *ptr, void *user_data) {
     beegfs_index_state_destroy((struct beegfs_index_state *) user_data);
 }
 
+static void global_exit(void *global) {
+    (void) global;
+    sqlite3_shutdown();
+}
+
 struct plugin_operations beegfs_index_ops = {
     .type         = PLUGIN_INDEX,
-    .global_init  = NULL,
+    .global_init  = global_init,
     .ctx_init     = ctx_init,
     .process_dir  = NULL,
     .process_file = process_entry,
     .ctx_exit     = ctx_exit,
-    .global_exit  = NULL,
+    .global_exit  = global_exit,
 };
