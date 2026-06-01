@@ -62,17 +62,7 @@ OF SUCH DAMAGE.
 
 
 
-#include <errno.h>
-#include <fcntl.h>
-#include <stdio.h>
-#include <string.h>
-#include <unistd.h>
-
 #include "bf.h"
-#include "dsi.h"
-#include "plugin.h"
-#include "utils.h"           /* copyfd and SNFORMAT_S */
-#include "xattrs.h"
 
 static int dsi_indexing_global_init(void *global) {
     struct input *in = (struct input *) global;
@@ -80,91 +70,12 @@ static int dsi_indexing_global_init(void *global) {
     return 0;
 }
 
-static void dsi_indexing_dir(void *ptr, void *user_data) {
-    PCS_t *pcs = (PCS_t *) ptr;
-    struct entry_data *ed = pcs->ed;
-    str_t *topath = (str_t *) pcs->data;
-    (void) user_data;
-
-    /* find DSI xattrs and copy collection dbs into current directory */
-    for(size_t i = 0; i < ed->xattrs.count; i++) {
-        struct xattr *xattr = &ed->xattrs.pairs[i];
-
-        if (!is_dsi_xattr(xattr->name, xattr->name_len)) {
-            continue;
-        }
-
-        /* get collection db name */
-        const char *collectiondb = xattr->value + DSI_VALUE_PREFIX_LEN;
-
-        const int src = open(collectiondb, O_RDONLY);
-        if (src < 0) {
-            const int err = errno;
-            fprintf(stderr, "Error: Could not open original collection db \"%s\": %s (%d)\n",
-                    collectiondb, strerror(err), err);
-            continue;
-        }
-
-        struct stat st;
-        if (lstat(collectiondb, &st) != 0) {
-            const int err = errno;
-            fprintf(stderr, "Error: Could not lstat original collection db \"%s\": %s (%d)\n",
-                    collectiondb, strerror(err), err);
-            goto close_src;
-        }
-
-        /*
-         * Renaming to collection name since collection names are
-         * unique but collection db file names are not
-         */
-        const size_t dstpath_len = topath->len + 1 + xattr->name_len - DSI_NAME_PREFIX_LEN + 3;
-        char *dstpath = malloc(dstpath_len + 1);
-        SNFORMAT_S(dstpath, dstpath_len + 1, 4,
-                   topath->data, topath->len,
-                   "/", (size_t) 1,
-                   xattr->name + DSI_NAME_PREFIX_LEN, xattr->name_len - DSI_NAME_PREFIX_LEN,
-                   ".db", (size_t) 3);
-
-        const int dst = open(dstpath, O_WRONLY | O_CREAT | O_TRUNC,
-                             st.st_mode & (S_IRWXU | S_IRWXG | S_IRWXO));
-        if (dst < 0) {
-            const int err = errno;
-            fprintf(stderr, "Error: Could not create collection db copy \"%s\": %s (%d)\n",
-                    dstpath, strerror(err), err);
-            goto free_dstpath;
-        }
-
-        /* do the copy */
-        const ssize_t copied = copyfd(src, 0, dst, 0, st.st_size);
-        if (copied != (ssize_t) st.st_size) {
-            const int err = errno;
-            fprintf(stderr, "Error: Could not copy collection db \"%s\" to \"%s\": %s (%d)\n",
-                    collectiondb, dstpath, strerror(err), err);
-            goto close_dst;
-        }
-
-        /* change ownership */
-        if (fchown(dst, st.st_uid, st.st_gid) != 0) {
-            const int err = errno;
-            fprintf(stderr, "Error: Could not fchown collection db copy \"%s\": %s (%d)\n",
-                    dstpath, strerror(err), err);
-            /* fallthrough */
-        }
-
-      close_dst:
-        close(dst);
-      free_dstpath:
-        free(dstpath);
-      close_src:
-        close(src);
-    }
-}
-
 struct plugin_operations gufi_plugin_operations = {
     .type = PLUGIN_INDEX,
     .global_init = dsi_indexing_global_init,
+    .dir_action = NULL,
     .ctx_init = NULL,
-    .process_dir = dsi_indexing_dir,
+    .process_dir = NULL,
     .process_file = NULL,
     .ctx_exit = NULL,
     .global_exit = NULL,

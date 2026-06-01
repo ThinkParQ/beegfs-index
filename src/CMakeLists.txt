@@ -75,7 +75,8 @@ set(GUFI_SOURCES
   dbutils.c
   debug.c
   descend.c
-  external.c
+  external_attach.c
+  external_copy.c
   gufi_vt.c
   histogram.c
   outfiles.c
@@ -112,8 +113,8 @@ set_source_files_properties(bf.c PROPERTIES COMPILE_FLAGS -DGUFI_VERSION="${VERS
 #If the GPFS library exists, build the gpfs scan tool
 if (GPFS_LIB AND GPFS_BUILD)
   include_directories("/usr/lpp/mmfs/include")
-  add_executable(gpfs-scan-tool gpfs-scan-tool.c)
-  target_link_libraries(gpfs-scan-tool ${GPFS_LIB} ${COMMON_LIBRARIES})
+  add_executable(gpfs_inode_scan_partitioned gpfs_inode_scan_partitioned.c)
+  target_link_libraries(gpfs_inode_scan_partitioned ${GPFS_LIB} ${COMMON_LIBRARIES})
 endif()
 
 # This function builds C executables using the provided file names
@@ -138,6 +139,11 @@ function(build_and_install_one PATH LINK_GUFI TARGET)
   if (LINK_GUFI)
     target_link_libraries(${TARGET} ${COMMON_LIBRARIES})
     add_dependencies(${TARGET} GUFI)
+
+    if (DEP_AI)
+      set_property(TARGET ${TARGET} PROPERTY BUILD_RPATH   "${DEP_INSTALL_PREFIX}/llama.cpp/lib")
+      set_property(TARGET ${TARGET} PROPERTY INSTALL_RPATH "${DEP_INSTALL_PREFIX}/llama.cpp/lib")
+    endif()
   endif()
 
   # install the executable
@@ -174,7 +180,7 @@ set(C_SOURCES
 # build the C executables
 build_and_install("${SERVER_BIN}" TRUE ${C_SOURCES})
 
-set_target_properties(gufi_dir2index PROPERTIES ENABLE_EXPORTS TRUE)
+set_property(TARGET gufi_dir2index PROPERTY ENABLE_EXPORTS TRUE)
 
 # this is the gufi_stat binary that operates on indexes directly
 build_and_install_one("${SERVER_BIN}" TRUE gufi_stat_bin gufi_stat.c)
@@ -189,7 +195,7 @@ endif()
 add_library(gufi_query_lib OBJECT
   gufi_query/PoolArgs.c
   gufi_query/aggregate.c
-  gufi_query/external.c
+  gufi_query/external_attach.c
   gufi_query/gqw.c
   gufi_query/handle_sql.c
   gufi_query/process_queries.c
@@ -219,7 +225,7 @@ if (ALLOW_DB_WRITES)
   target_compile_definitions(gufi_query PUBLIC ALLOW_DB_WRITES=1)
 endif()
 
-set_target_properties(gufi_query PROPERTIES ENABLE_EXPORTS TRUE)
+set_property(TARGET gufi_query PROPERTY ENABLE_EXPORTS TRUE)
 
 # build custom SQLite virtual tables
 add_library(gufi_vt MODULE
@@ -232,7 +238,8 @@ add_library(gufi_vt MODULE
   bf.c
   dbutils.c
   debug.c
-  external.c
+  external_attach.c
+  external_copy.c
   histogram.c
   path_list.c
   plugin.c
@@ -243,12 +250,13 @@ add_library(gufi_vt MODULE
   utils.c
   xattrs.c
 )
-set_target_properties(gufi_vt PROPERTIES PREFIX "")
-set_target_properties(gufi_vt PROPERTIES BUILD_RPATH   "${DEP_INSTALL_PREFIX}/sqlite3-pcre"
-                                         INSTALL_RPATH "${DEP_INSTALL_PREFIX}/sqlite3-pcre")
+set_property(TARGET gufi_vt PROPERTY PREFIX "")
+set_property(TARGET gufi_vt PROPERTY BUILD_RPATH   "${DEP_INSTALL_PREFIX}/sqlite3-pcre")
+set_property(TARGET gufi_vt PROPERTY INSTALL_RPATH "${DEP_INSTALL_PREFIX}/sqlite3-pcre")
+
 if (APPLE OR DARWIN)
   # https://gitlab.kitware.com/cmake/cmake/-/issues/21189
-  set_target_properties(gufi_vt PROPERTIES SUFFIX ".${EXT}")
+  set_property(TARGET gufi_vt PROPERTY SUFFIX ".${EXT}")
 endif()
 
 # libsqlite3 needs to be linked in order to get sqlite3_initialize
@@ -260,6 +268,7 @@ endif()
 target_link_libraries(gufi_vt
   "${DEP_INSTALL_PREFIX}/sqlite3/lib/libsqlite3.${EXT}"
   "${DEP_INSTALL_PREFIX}/sqlite3-pcre/libsqlite3-pcre.${EXT}"
+  pcre2-8
 )
 add_dependencies(gufi_vt install_dependencies)
 install(TARGETS gufi_vt DESTINATION "${SERVER_LIB}" COMPONENT Server)
@@ -277,11 +286,11 @@ endif()
 add_library(run_vt MODULE
   run_vt.c
 )
-set_target_properties(run_vt PROPERTIES PREFIX "")
+set_property(TARGET run_vt PROPERTY PREFIX "")
 add_dependencies(run_vt install_dependencies)
 if (APPLE OR DARWIN)
   # https://gitlab.kitware.com/cmake/cmake/-/issues/21189
-  set_target_properties(run_vt PROPERTIES SUFFIX ".${EXT}")
+  set_property(TARGET run_vt PROPERTY SUFFIX ".${EXT}")
 endif()
 install(TARGETS run_vt DESTINATION "${SERVER_LIB}" COMPONENT Server)
 
@@ -319,12 +328,12 @@ if (MY_FUSE_FOUND AND FUSE_BUILD)
 
   # create the bffuse executable
   add_executable(bffuse bffuse.c)
-  set_target_properties(bffuse PROPERTIES COMPILE_FLAGS "${MY_FUSE_CFLAGS}")
+  set_property(TARGET bffuse PROPERTY COMPILE_FLAGS "${MY_FUSE_CFLAGS}")
   target_link_libraries(bffuse ${COMMON_LIBRARIES} ${MY_FUSE_LDFLAGS})
 
   # create the bfresultfuse executable
   add_executable(bfresultfuse bfresultfuse.c)
-  set_target_properties(bfresultfuse PROPERTIES COMPILE_FLAGS "${MY_FUSE_CFLAGS}")
+  set_property(TARGET bfresultfuse PROPERTY COMPILE_FLAGS "${MY_FUSE_CFLAGS}")
   target_link_libraries(bfresultfuse ${COMMON_LIBRARIES} ${MY_FUSE_LDFLAGS})
 
   # install the fuse binaries in ${CMAKE_INSTALL_PREFIX}/${SERVER_BIN}

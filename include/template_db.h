@@ -70,6 +70,7 @@ OF SUCH DAMAGE.
 #include <sqlite3.h>
 
 #include "bf.h"
+#include "str.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -85,15 +86,15 @@ int create_template(struct template_db *tdb, int (*create_tables)(const char *, 
                     const char *name);
 
 int create_xattr_tables(const char *name, sqlite3 *db, void *args);
-int create_xattrs_template(struct template_db *tdb);
+int create_xattrs_template(struct template_db *tdb, const str_t *dir);
 
 int create_dbdb_tables(const char *name, sqlite3 *db, void *args);
-int create_dbdb_template(struct template_db *tdb);
+int create_dbdb_template(struct template_db *tdb, const str_t *dir);
 
 int close_template_db(struct template_db *tdb);
 
-int copy_template(struct template_db *tdb, const char * dst, uid_t uid, gid_t gid);
-sqlite3 *template_to_db(struct template_db *tdb, const char *dst, uid_t uid, gid_t gid);
+int copy_template(struct template_db *tdb, const char * dst, uid_t uid, gid_t gid, int *err);
+sqlite3 *template_to_db(struct template_db *tdb, const char *dst, uid_t uid, gid_t gid, int *copy_err);
 
 /* create db.db with empty tables at the given directory (and leave it on the filesystem) */
 int create_empty_dbdb(struct template_db *tdb, str_t *dst, uid_t uid, gid_t gid);

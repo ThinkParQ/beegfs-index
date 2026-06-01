@@ -1,0 +1,166 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<!--
+This file is part of GUFI, which is part of MarFS, which is released
+under the BSD license.
+
+
+Copyright (c) 2017, Los Alamos National Security (LANS), LLC
+All rights reserved.
+
+Redistribution and use in source and binary forms, with or without modification,
+are permitted provided that the following conditions are met:
+
+1. Redistributions of source code must retain the above copyright notice, this
+list of conditions and the following disclaimer.
+
+2. Redistributions in binary form must reproduce the above copyright notice,
+this list of conditions and the following disclaimer in the documentation and/or
+other materials provided with the distribution.
+
+3. Neither the name of the copyright holder nor the names of its contributors
+may be used to endorse or promote products derived from this software without
+specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT,
+INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF
+LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE
+OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF
+ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+
+From Los Alamos National Security, LLC:
+LA-CC-15-039
+
+Copyright (c) 2017, Los Alamos National Security, LLC All rights reserved.
+Copyright 2017. Los Alamos National Security, LLC. This software was produced
+under U.S. Government contract DE-AC52-06NA25396 for Los Alamos National
+Laboratory (LANL), which is operated by Los Alamos National Security, LLC for
+the U.S. Department of Energy. The U.S. Government has rights to use,
+reproduce, and distribute this software.  NEITHER THE GOVERNMENT NOR LOS
+ALAMOS NATIONAL SECURITY, LLC MAKES ANY WARRANTY, EXPRESS OR IMPLIED, OR
+ASSUMES ANY LIABILITY FOR THE USE OF THIS SOFTWARE.  If software is
+modified to produce derivative works, such modified software should be
+clearly marked, so as not to confuse it with the version available from
+LANL.
+
+THIS SOFTWARE IS PROVIDED BY LOS ALAMOS NATIONAL SECURITY, LLC AND CONTRIBUTORS
+"AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO,
+THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ARE DISCLAIMED. IN NO EVENT SHALL LOS ALAMOS NATIONAL SECURITY, LLC OR
+CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
+EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT
+OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING
+IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY
+OF SUCH DAMAGE.
+-->
+
+<!-- MarFS Test Configuration -->
+<marfs_config version="2025-09-25">
+   <!-- Mount Point -->
+   <mnt_top>/marfs</mnt_top>
+
+   <!-- Test Repo Definition -->
+   <repo name="TestRepo">
+
+      <!-- Per-Repo Data Scheme -->
+      <data>
+
+         <!-- Erasure Protection -->
+         <protection>
+            <N>3</N>
+            <E>1</E>
+            <PSZ>1048572</PSZ>
+         </protection>
+
+         <!-- Packing -->
+         <packing enabled="yes">
+            <max_files>4096</max_files>
+         </packing>
+
+         <!-- Chunking -->
+         <chunking enabled="yes">
+            <max_size>4G</max_size>
+         </chunking>
+
+         <!-- Object Distribution -->
+         <distribution>
+            <pods cnt="1"/>
+            <caps cnt="1"/>
+            <scatters cnt="1024"/>
+         </distribution>
+
+         <!-- DAL Definition -->
+         <DAL type="posix">
+            <dir_template>pod{p}/block{b}/cap{c}/scat{s}/</dir_template>
+            <sec_root>DAL_ROOT_PLACEHOLDER</sec_root>
+         </DAL>
+
+      </data>
+
+      <!-- Per-Repo Metadata Scheme -->
+      <meta>
+
+         <!-- Direct Data -->
+         <direct read="yes"/>
+
+         <!-- MDAL Definition -->
+         <MDAL type="posix">
+            <ns_root>NS_ROOT_PLACEHOLDER</ns_root>
+         </MDAL>
+
+         <!-- Namespace Definitions -->
+         <namespaces rbreadth="40" rdepth="3" rdigits="3">
+
+            <!-- Root Namespace -->
+            <ns name="root">
+
+               <!-- Quota Limits for this NS -->
+               <quotas>
+                  <data>10T</data>
+               </quotas>
+
+               <!-- Permission Settings for this NS -->
+               <perms>
+                  <interactive>RM,RD</interactive>
+                  <batch>RM,RD</batch>
+               </perms>
+
+               <!-- Test Subspace -->
+               <ns name="namespace1">
+                  <quotas>
+                     <data>5T</data>
+                  </quotas>
+                  <perms>
+                     <interactive>RM,WM,RD</interactive>
+                     <batch>RM,WM,RD,WD</batch>
+                  </perms>
+                  
+                  <!-- Nested Subspace -->
+                  <ns name="namespace2">
+                     <quotas>
+                        <data>2T</data>
+                     </quotas>
+                     <perms>
+                        <interactive>RM,WM,RD</interactive>
+                        <batch>RM,WM,RD,WD</batch>
+                     </perms>
+                  </ns>
+               </ns>
+
+            </ns>
+
+         </namespaces>
+
+      </meta>
+
+   </repo>
+
+</marfs_config>

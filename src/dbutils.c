@@ -74,7 +74,7 @@ OF SUCH DAMAGE.
 
 #include "BottomUp.h"
 #include "dbutils.h"
-#include "external.h"
+#include "external_attach.h"
 #include "histogram.h"
 #include "trie.h"
 
@@ -1005,7 +1005,7 @@ struct xattr_db *create_xattr_db(struct template_db *tdb,
     xdb->st.st_uid = uid;
     xdb->st.st_gid = gid;
 
-    if (copy_template(tdb, filename, xdb->st.st_uid, xdb->st.st_gid) != 0) {
+    if (copy_template(tdb, filename, xdb->st.st_uid, xdb->st.st_gid, NULL) != 0) {
         destroy_xattr_db(xdb);
         return NULL;
     }
@@ -1437,6 +1437,7 @@ static trie_t *sqlite3_types(void) {
     trie_insert(types, "REAL",    4, (void *) (uintptr_t) SQLITE_FLOAT,   NULL);
 
     trie_insert(types, "TEXT",    4, (void *) (uintptr_t) SQLITE_TEXT,    NULL);
+    trie_insert(types, "VARCHAR", 7, (void *) (uintptr_t) SQLITE_TEXT,    NULL);
 
     trie_insert(types, "BLOB",    4, (void *) (uintptr_t) SQLITE_BLOB,    NULL);
 

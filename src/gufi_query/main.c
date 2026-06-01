@@ -268,7 +268,8 @@ int main(int argc, char *argv[])
         /* SQL processing/tree walk flags */
         FLAG_DIR_MATCH_UID, FLAG_DIR_MATCH_GID, FLAG_PROCESS_SQL,
         FLAG_MIN_LEVEL, FLAG_MAX_LEVEL, FLAG_PATH_LIST,
-        FLAG_PATH, FLAG_XATTRS, FLAG_QUERY_XATTRS, FLAG_EXTERNAL_ATTACH,
+        FLAG_PATH, FLAG_XATTRS, FLAG_QUERY_XATTRS,
+        FLAG_EXTERNAL_ATTACH, FLAG_EXTERNAL_COPY,
         FLAG_PLUGIN,
 
         /* miscellaneous flags */
@@ -338,7 +339,7 @@ int main(int argc, char *argv[])
     }
 
     const uint64_t queue_limit = get_queue_limit(in.target_memory, in.maxthreads);
-    QPTPool_ctx_t *ctx = QPTPool_init_with_props(in.maxthreads, &pa, NULL, NULL, queue_limit, in.swap_prefix.data, 1, 2);
+    QPTPool_ctx_t *ctx = QPTPool_init_with_props(in.maxthreads, &pa, NULL, NULL, queue_limit, in.swap_prefix.data, 1, 2, 0);
     if (QPTPool_start(ctx) != 0) {
         fprintf(stderr, "Error: Failed to start thread pool\n");
         QPTPool_destroy(ctx);
@@ -348,12 +349,6 @@ int main(int argc, char *argv[])
     }
 
     /* initial set up done, can start processing and printing results */
-
-    /* print the tlv header to indicate that the output is results and not the help output */
-    if (in.types.print_tlv) {
-        /* --print-tlv can only go to stdout */
-        fwrite(TLV_PREFIX, sizeof(char), sizeof(TLV_PREFIX), stdout);
-    }
 
     if (doing_partial_walk(&in, root_count)) {
         if (root_count == 0) {

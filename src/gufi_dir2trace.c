@@ -77,7 +77,7 @@ OF SUCH DAMAGE.
 #include "bf.h"
 #include "dbutils.h"
 #include "debug.h"
-#include "external.h"
+#include "external_attach.h"
 #include "outfiles.h"
 #include "path_list.h"
 #include "str.h"
@@ -166,13 +166,14 @@ static int processdir(QPTPool_ctx_t *ctx, void *data) {
 
     DIR *dir = opendir_wrapper(work->name, 1);
     if (!dir) {
-        rc = 1;
+        rc = 0;
         goto cleanup;
     }
 
     memset(&ed, 0, sizeof(ed));
     if (lstat_wrapper(work->name, &work->statuso, &work->crtime,
                       &work->stat_called, 1, 1) != 0) {
+        rc = 0;
         goto close_dir;
     }
 
@@ -272,7 +273,7 @@ int main(int argc, char *argv[]) {
         FLAG_INDEX_XATTRS, FLAG_SKIP_FILE,
 
         /* miscellaneous flags */
-        FLAG_CHECK_EXTDB_VALID,
+        FLAG_EXTERNAL_ATTACH_VALIDATE,
 
         /* output flags */
         FLAG_DELIM,
@@ -309,7 +310,7 @@ int main(int argc, char *argv[]) {
     }
 
     const uint64_t queue_limit = get_queue_limit(pa.in.target_memory, pa.in.maxthreads);
-    QPTPool_ctx_t *ctx = QPTPool_init_with_props(pa.in.maxthreads, &pa, NULL, NULL, queue_limit, pa.in.swap_prefix.data, 1, 2);
+    QPTPool_ctx_t *ctx = QPTPool_init_with_props(pa.in.maxthreads, &pa, NULL, NULL, queue_limit, pa.in.swap_prefix.data, 1, 2, 1);
     if (QPTPool_start(ctx) != 0) {
         fprintf(stderr, "Error: Failed to start thread pool\n");
         QPTPool_destroy(ctx);
@@ -365,6 +366,10 @@ int main(int argc, char *argv[]) {
     /* don't count as part of processtime */
 
     const uint64_t thread_count = QPTPool_threads_completed(ctx);
+
+    if (QPTPool_stopped_on_error(ctx) == 1) {
+        rc = EXIT_FAILURE;
+    }
 
     QPTPool_destroy(ctx);
 

@@ -75,12 +75,12 @@ jobs:
   CodeCoverage:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@main
       with:
         fetch-depth: 0
         fetch-tags: true
 
-    - uses: actions/cache@v4
+    - uses: actions/cache@main
       with:
         path: ${{ env.DEP_INSTALL_PREFIX }}
         key:  ${{ runner.os }}-CodeCoverage
@@ -120,21 +120,23 @@ jobs:
             ${{ github.workspace }}/build/test/unit/python/test_gufi_config.py
 
             export GUFI_PYTHON_TEST_COVERAGE="coverage run -a"
-            (${{ github.workspace }}/build/test/regression/gufi_distributed.sh         || true) > /dev/null 2>&1
-            (${{ github.workspace }}/build/test/regression/gufi_du.sh                  || true) > /dev/null 2>&1
-            (${{ github.workspace }}/build/test/regression/gufi_find.sh                || true) > /dev/null 2>&1
-            (${{ github.workspace }}/build/test/regression/gufi_getfattr.sh            || true) > /dev/null 2>&1
-            (${{ github.workspace }}/build/test/regression/gufi_ls.sh                  || true) > /dev/null 2>&1
-            (${{ github.workspace }}/build/test/regression/gufi_stat.sh                || true) > /dev/null 2>&1
-            (${{ github.workspace }}/build/test/regression/gufi_stats.sh               || true) > /dev/null 2>&1
-            (${{ github.workspace }}/build/test/regression/longitudinal_snapshot.sh    || true) > /dev/null 2>&1
-            (${{ github.workspace }}/build/test/regression/querydbs.sh                 || true) > /dev/null 2>&1
+            (${{ github.workspace }}/build/test/regression/gufi_distributed.sh            || true) > /dev/null 2>&1
+            (${{ github.workspace }}/build/test/regression/gufi_du.sh                     || true) > /dev/null 2>&1
+            (${{ github.workspace }}/build/test/regression/gufi_find.sh                   || true) > /dev/null 2>&1
+            (${{ github.workspace }}/build/test/regression/gufi_getfattr.sh               || true) > /dev/null 2>&1
+            (${{ github.workspace }}/build/test/regression/gufi_ls.sh                     || true) > /dev/null 2>&1
+            (${{ github.workspace }}/build/test/regression/gufi_stat.sh                   || true) > /dev/null 2>&1
+            (${{ github.workspace }}/build/test/regression/gufi_stats.sh                  || true) > /dev/null 2>&1
+            (${{ github.workspace }}/build/test/regression/gufi_query_multiple_remotes.sh || true) > /dev/null 2>&1
+            (${{ github.workspace }}/build/test/regression/import.sh                      || true) > /dev/null 2>&1
+            (${{ github.workspace }}/build/test/regression/longitudinal_snapshot.sh       || true) > /dev/null 2>&1
+            (${{ github.workspace }}/build/test/regression/querydbs.sh                    || true) > /dev/null 2>&1
 
             coverage xml --omit="${{ github.workspace }}/build/contrib/hashes.py,,${{ github.workspace }}/build/test/*,${{ github.workspace }}/build/test/regression/*,${{ github.workspace }}/build/test/unit/python/*"
             rm .coverage  # If not removed, codecov will attempt to run coverage xml which will not account for our omissions
 
     - name: Upload coverage to Codecov
-      uses: codecov/codecov-action@v5
+      uses: codecov/codecov-action@main
       with:
         fail_ci_if_error: true
         token: ${{ secrets.CODECOV_TOKEN }}

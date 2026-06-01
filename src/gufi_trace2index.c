@@ -73,7 +73,7 @@ OF SUCH DAMAGE.
 #include "bf.h"
 #include "dbutils.h"
 #include "debug.h"
-#include "external.h"
+#include "external_attach.h"
 #include "str.h"
 #include "template_db.h"
 #include "trace.h"
@@ -189,13 +189,16 @@ static int processdir(QPTPool_ctx_t *ctx, void *data) {
         free(nda.topath);
         free(dir);
         row_destroy(&w);
-        return 1;
+        return (err == ENOSPC);
     }
 
     /* restore "/db.db" (no need to remove afterwards) */
     nda.topath[nda.topath_len] = '/';
 
-    sqlite3 *db = template_to_db(&nda.pa->db, nda.topath, dir->statuso.st_uid, dir->statuso.st_gid);
+    int copy_err = 0;
+    sqlite3 *db = template_to_db(&nda.pa->db, nda.topath,
+                                 dir->statuso.st_uid, dir->statuso.st_gid,
+                                 &copy_err);
 
     if (db) {
         zeroit(&nda.summary);
@@ -257,7 +260,12 @@ static int processdir(QPTPool_ctx_t *ctx, void *data) {
     free(dir);
     row_destroy(&w);
 
-    return !db;
+    if (!db) {
+        /* if no space, return 1 and stop all processing, else return 0 */
+        return (copy_err == ENOSPC);
+    }
+
+    return 0;
 }
 
 static void sub_help(void) {
@@ -297,15 +305,15 @@ int main(int argc, char *argv[]) {
 
     int rc = EXIT_SUCCESS;
 
-    init_template_db(&pa.db);
-    if (create_dbdb_template(&pa.db) != 0) {
-        fprintf(stderr, "Could not create template file\n");
+    if (dupdir(pa.index_parent.data, S_IRWXU | S_IRWXG | S_IRWXO, geteuid(), getegid())) {
+        fprintf(stderr, "Could not create directory %s\n", pa.index_parent.data);
         rc = EXIT_FAILURE;
         goto free_traces;
     }
 
-    if (dupdir(pa.index_parent.data, S_IRWXU | S_IRWXG | S_IRWXO, geteuid(), getegid())) {
-        fprintf(stderr, "Could not create directory %s\n", pa.index_parent.data);
+    init_template_db(&pa.db);
+    if (create_dbdb_template(&pa.db, &pa.index_parent) != 0) {
+        fprintf(stderr, "Could not create template file\n");
         rc = EXIT_FAILURE;
         goto free_traces;
     }
@@ -321,14 +329,14 @@ int main(int argc, char *argv[]) {
     }
 
     init_template_db(&pa.xattr);
-    if (create_xattrs_template(&pa.xattr) != 0) {
+    if (create_xattrs_template(&pa.xattr, &pa.index_parent) != 0) {
         fprintf(stderr, "Could not create xattr template file\n");
         rc = EXIT_FAILURE;
         goto free_db;
     }
 
     const uint64_t queue_limit = get_queue_limit(pa.in.target_memory, pa.in.maxthreads);
-    QPTPool_ctx_t *ctx = QPTPool_init_with_props(pa.in.maxthreads, &pa, NULL, NULL, queue_limit, pa.in.swap_prefix.data, 1, 2);
+    QPTPool_ctx_t *ctx = QPTPool_init_with_props(pa.in.maxthreads, &pa, NULL, NULL, queue_limit, pa.in.swap_prefix.data, 1, 2, 1);
 
     if (QPTPool_start(ctx) != 0) {
         fprintf(stderr, "Error: Failed to start thread pool\n");
@@ -381,6 +389,11 @@ int main(int argc, char *argv[]) {
     const long double processtime = sec(nsec(&after_init));
 
     /* don't count as part of processtime */
+
+    if (QPTPool_stopped_on_error(ctx) == 1) {
+        rc = EXIT_FAILURE;
+    }
+
     QPTPool_destroy(ctx);
 
     /* set top level permissions */

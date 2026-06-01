@@ -77,13 +77,12 @@ Obtain a copy of the source code from GitHub: \\
 \href{https://github.com/mar-file-system/GUFI.git}{\texttt{https://github.com/mar-file-system/GUFI.git}}
 
 \subsection{RPMs}
-Alternatively, three pre-built RPMs are attached to the assets of
+Alternatively, two pre-built RPMs are attached to the assets of
 \href{https://github.com/mar-file-system/GUFI/releases}{each release
-  on GitHub}. If proceeding with the RPMs, only download and install
-the RPM without \texttt{server} or \texttt{client} in its name. The
-Python3 library files required by the user facing tools
-(Section~\ref{sec:user_facing_tools}) will be installed into the
-site-packages directory.
+ on GitHub}. If proceeding with the RPMs, only download and install
+the gufi-server RPM. The Python3 library files required by the user
+facing tools (Section~\ref{sec:user_facing_tools}) will be installed
+into the site-packages directory.
 
 Then, skip to Section~\ref{sec:usage}.
 
@@ -134,8 +133,8 @@ Some particularly useful ones are listed here: \\
     \hline
     \texttt{DEP\_AI=<ON|OFF>} & Enable or disable building sqlite-vec,
     sqlite-lembed, llama.cpp, and other AI related files. \\
-    & Note that llama.cpp is not bundled with GUFI, and is downloaded
-    during the dependency build step. \\
+    & Note that OpenMP is left enabled in llama.cpp and thus required
+    by GUFI when enabled. \\
     \hline
     \texttt{DEP\_BUILD\_THREADS=<thread count>} & Build dependencies with
     this many threads to speed up builds. \\

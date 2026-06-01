@@ -61,6 +61,8 @@
 
 
 
+# shellcheck shell=dash
+
 set -e
 
 apk update
@@ -71,6 +73,7 @@ apk add \
     fuse3-dev \
     jemalloc-dev \
     jemalloc-static \
+    linux-headers \
     openmp-dev \
     pcre2-dev \
     zlib-dev

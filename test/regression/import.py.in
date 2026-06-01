@@ -1,0 +1,138 @@
+#!@Python3_SHEBANG@
+# This file is part of GUFI, which is part of MarFS, which is released
+# under the BSD license.
+#
+#
+# Copyright (c) 2017, Los Alamos National Security (LANS), LLC
+# All rights reserved.
+#
+# Redistribution and use in source and binary forms, with or without modification,
+# are permitted provided that the following conditions are met:
+#
+# 1. Redistributions of source code must retain the above copyright notice, this
+# list of conditions and the following disclaimer.
+#
+# 2. Redistributions in binary form must reproduce the above copyright notice,
+# this list of conditions and the following disclaimer in the documentation and/or
+# other materials provided with the distribution.
+#
+# 3. Neither the name of the copyright holder nor the names of its contributors
+# may be used to endorse or promote products derived from this software without
+# specific prior written permission.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+# ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+# WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+# IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT,
+# INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+# BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+# DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF
+# LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE
+# OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF
+# ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+#
+#
+# From Los Alamos National Security, LLC:
+# LA-CC-15-039
+#
+# Copyright (c) 2017, Los Alamos National Security, LLC All rights reserved.
+# Copyright 2017. Los Alamos National Security, LLC. This software was produced
+# under U.S. Government contract DE-AC52-06NA25396 for Los Alamos National
+# Laboratory (LANL), which is operated by Los Alamos National Security, LLC for
+# the U.S. Department of Energy. The U.S. Government has rights to use,
+# reproduce, and distribute this software.  NEITHER THE GOVERNMENT NOR LOS
+# ALAMOS NATIONAL SECURITY, LLC MAKES ANY WARRANTY, EXPRESS OR IMPLIED, OR
+# ASSUMES ANY LIABILITY FOR THE USE OF THIS SOFTWARE.  If software is
+# modified to produce derivative works, such modified software should be
+# clearly marked, so as not to confuse it with the version available from
+# LANL.
+#
+# THIS SOFTWARE IS PROVIDED BY LOS ALAMOS NATIONAL SECURITY, LLC AND CONTRIBUTORS
+# "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO,
+# THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+# ARE DISCLAIMED. IN NO EVENT SHALL LOS ALAMOS NATIONAL SECURITY, LLC OR
+# CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
+# EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT
+# OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+# INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+# CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING
+# IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY
+# OF SUCH DAMAGE.
+
+
+
+import os
+import subprocess
+import unittest
+
+import gufi_config
+import gufi_tool
+
+# not really a unit test
+class TestImportingUserFacingScripts(unittest.TestCase):
+    def setUp(self):
+        self.path = 'prefix'
+
+    def expect(self, tool, args, stdout_eq=None, stderr_ne=None):
+        tool = gufi_tool.import_tool('', gufi_tool.TOOLS[tool][1])
+        rc, out, err = tool.run([''] + args, gufi_tool.CONFIG_PATH,
+                                subprocess.PIPE, subprocess.PIPE)
+        self.assertEqual(rc, 0)
+        self.assertEqual(type(out), str)
+        if stdout_eq is None:
+            self.assertNotEqual(out, '')          # default: stdout is not empty
+        else:
+            self.assertEqual(out, stdout_eq)
+        print()
+        print(out)
+        self.assertEqual(type(err), str)
+        if stderr_ne is None:
+            self.assertEqual(err, '')             # default: nothing in stderr
+        else:
+            self.assertNotEqual(err, stderr_ne)
+
+    def test_gufi_du(self):
+        self.expect('du', [self.path])
+
+    def test_gufi_find(self):
+        self.expect('find', [self.path])
+
+    def test_gufi_getfattr(self):
+        self.expect('getfattr', ['-d', '-m', '.*', os.path.join(self.path, '1MB')])
+
+    def test_gufi_ls(self):
+        self.expect('ls', ['-al', self.path])
+
+    def test_gufi_query(self):
+        indexroot = gufi_config.Server(gufi_tool.CONFIG_PATH).indexroot
+        self.expect('query.py', ['-E', 'SELECT rpath(sname, sroll, name) FROM vrpentries;', indexroot])
+
+    def test_gufi_query_multiple_remotes(self):
+        indexroot = gufi_config.Server(gufi_tool.CONFIG_PATH).indexroot
+        self.expect('query_multiple_remotes',
+                           ['-E', 'SELECT rpath(sname, sroll, name) FROM vrpentries;',
+                            '--verbose',
+                            '@CMAKE_BINARY_DIR@/src/gufi_vt',
+                            'ssh',
+                            '--remote-cmd', '@CMAKE_CURRENT_BINARY_DIR@/ssh.fake',
+                            'remote1', indexroot,
+                            'remote2', indexroot],
+                           stderr_ne='')
+        self.expect('query_multiple_remotes',
+                           ['-E', 'SELECT rpath(sname, sroll, name) FROM vrpentries;',
+                            '--verbose',
+                            '@CMAKE_BINARY_DIR@/src/gufi_vt',
+                            'pdsh',
+                            '--remote-cmd', '@CMAKE_CURRENT_BINARY_DIR@/pdsh.fake',
+                            'remote1', 'remote2',
+                            indexroot],
+                           stderr_ne='')
+
+    def test_gufi_stat(self):
+        self.expect('stat', [self.path])
+
+    def test_gufi_stats(self):
+        self.expect('stats', ['--recursive', 'depth', self.path])
+
+if __name__ == '__main__':
+    unittest.main()

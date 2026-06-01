@@ -68,14 +68,14 @@ env:
   CC: clang
   CXX: clang++
   DEP_INSTALL_PREFIX: ~/.local
-  COMMON_CONFIG: -DCMAKE_BUILD_TYPE=Debug -DCMAKE_C_FLAGS="-Wall -Wextra -Werror -Wpedantic -Wwrite-strings" -DCMAKE_CXX_FLAGS="-Wall -Wextra -Werror -Wpedantic -Wwrite-strings" -DDEP_INSTALL_PREFIX="${DEP_INSTALL_PREFIX}" -DDEP_BUILD_THREADS=2 -DENABLE_SUDO_TESTS=On -DCLIENT=On
+  COMMON_CONFIG: -DCMAKE_BUILD_TYPE=Debug -DCMAKE_C_FLAGS="-Wall -Wextra -Werror -Wpedantic -Wwrite-strings" -DCMAKE_CXX_FLAGS="-Wall -Wextra -Werror -Wpedantic -Wwrite-strings" -DDEP_INSTALL_PREFIX="${DEP_INSTALL_PREFIX}" -DDEP_BUILD_THREADS=2 -DENABLE_SUDO_TESTS=On -DCLIENT=On -DDEP_AI=On
   PIP_BREAK_SYSTEM_PACKAGES: 1
 
 jobs:
   ShellCheck:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@main
 
     - name: Install ShellCheck
       run:  sudo apt -y install shellcheck
@@ -86,31 +86,16 @@ jobs:
   Pylint:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v4
-      with:
-        fetch-depth: 0
-        fetch-tags: true
+    - uses: actions/checkout@main
 
-    - uses: actions/cache@v4
-      with:
-        path: ${{ env.DEP_INSTALL_PREFIX }}
-        key:  ${{ runner.os }}-pylint
+    - name: Install pip
+      run:  sudo apt install -y python3-pip
 
-    - name: Ubuntu Prerequisites
-      run:  sudo contrib/CI/ubuntu.sh
-
-    - name: Install Python Packages
-      run:  python3 -m pip install -r contrib/CI/requirements.txt
-
-    - name: Install Extra Python Packages
+    - name: Install Pylint
       run:  python3 -m pip install pylint
 
-    - name: Configure CMake
-      run:  cmake -B ${{ github.workspace }}/build ${{ env.COMMON_CONFIG }}
-
-    - name: Run Python3 Pylint
-      working-directory: ${{ github.workspace }}/build
-      run:  make pylint
+    - name: Run Pylint
+      run:  contrib/pylint.sh ${{ github.workspace }}
 
   Older_CMake:
     needs: [ShellCheck, Pylint]
@@ -118,9 +103,9 @@ jobs:
     container:
       image: rockylinux:9
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@main
 
-    - uses: actions/cache@v4
+    - uses: actions/cache@main
       with:
         path: ${{ env.DEP_INSTALL_PREFIX }}
         key:  ${{ runner.os }}-old-cmake
@@ -133,6 +118,9 @@ jobs:
 
     - name: Install Python Packages
       run:  python3 -m pip install -r contrib/CI/requirements.txt
+
+    - name: Install Marfs & ISA-L
+      run:  contrib/deps/marfs.sh ${{ github.workspace }}/build/builds ${{ env.DEP_INSTALL_PREFIX }} 2
 
     - name: Uninstall CMake from package manager
       run:  yum -y autoremove cmake3
@@ -147,7 +135,7 @@ jobs:
       run:  |
             mkdir -p build
             cd build
-            cmake .. ${{ env.COMMON_CONFIG }}
+            cmake .. ${{ env.COMMON_CONFIG }} -DMARFS_PREFIX=${{ env.DEP_INSTALL_PREFIX }}/marfs
 
     - name: Build
       working-directory: ${{ github.workspace }}/build
@@ -161,12 +149,12 @@ jobs:
     needs: [ShellCheck, Pylint]
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@main
       with:
         fetch-depth: 0
         fetch-tags: true
 
-    - uses: actions/cache@v4
+    - uses: actions/cache@main
       with:
         path: ${{ env.DEP_INSTALL_PREFIX }}
         key:  ${{ runner.os }}-test-directory
@@ -177,8 +165,11 @@ jobs:
     - name: Install Python Packages
       run:  python3 -m pip install -r contrib/CI/requirements.txt
 
+    - name: Install Marfs & ISA-L
+      run:  contrib/deps/marfs.sh ${{ github.workspace }}/build/builds ${{ env.DEP_INSTALL_PREFIX }} 2
+
     - name: Configure CMake
-      run:  cmake -B ${{ github.workspace }}/build ${{ env.COMMON_CONFIG }} -DTEST_WORKING_DIRECTORY=/tmp
+      run:  cmake -B ${{ github.workspace }}/build ${{ env.COMMON_CONFIG }} -DTEST_WORKING_DIRECTORY=/tmp -DMARFS_PREFIX=${{ env.DEP_INSTALL_PREFIX }}/marfs
 
     - name: Build
       run:  cmake --build ${{ github.workspace }}/build -j
@@ -191,15 +182,15 @@ jobs:
     needs: [ShellCheck, Pylint]
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@main
       with:
         fetch-depth: 0
         fetch-tags: true
 
-    - uses: actions/cache@v4
+    - uses: actions/cache@main
       with:
         path: ${{ env.DEP_INSTALL_PREFIX }}
-        key:  ${{ runner.os }}-test-directory
+        key:  ${{ runner.os }}-no-db-writes
 
     - name: Ubuntu Prerequisites
       run:  sudo contrib/CI/ubuntu.sh
@@ -207,8 +198,11 @@ jobs:
     - name: Install Python Packages
       run:  python3 -m pip install -r contrib/CI/requirements.txt
 
+    - name: Install Marfs & ISA-L
+      run:  contrib/deps/marfs.sh ${{ github.workspace }}/build/builds ${{ env.DEP_INSTALL_PREFIX }} 2
+
     - name: Configure CMake
-      run:  cmake -B ${{ github.workspace }}/build ${{ env.COMMON_CONFIG }} -DALLOW_DB_WRITES=Off
+      run:  cmake -B ${{ github.workspace }}/build ${{ env.COMMON_CONFIG }} -DALLOW_DB_WRITES=Off -DMARFS_PREFIX=${{ env.DEP_INSTALL_PREFIX }}/marfs
 
     - name: Build
       run:  cmake --build ${{ github.workspace }}/build -j
@@ -224,12 +218,12 @@ jobs:
       CC: gcc
       CXX: g++
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@main
       with:
         fetch-depth: 0
         fetch-tags: true
 
-    - uses: actions/cache@v4
+    - uses: actions/cache@main
       with:
         path: ${{ env.DEP_INSTALL_PREFIX }}
         key:  ${{ runner.os }}-ASAN-LSAN-UBSAN
@@ -240,26 +234,29 @@ jobs:
     - name: Install Python Packages
       run:  python3 -m pip install -r contrib/CI/requirements.txt
 
+    - name: Install Marfs & ISA-L
+      run:  contrib/deps/marfs.sh ${{ github.workspace }}/build/builds ${{ env.DEP_INSTALL_PREFIX }} 2
+
     - name: Configure CMake
-      run:  cmake -B ${{ github.workspace }}/build ${{ env.COMMON_CONFIG }} -DCMAKE_BUILD_TYPE=Debug -DFSANITIZE="address,leak,pointer-compare,pointer-subtract,undefined"
+      run:  cmake -B ${{ github.workspace }}/build ${{ env.COMMON_CONFIG }} -DCMAKE_BUILD_TYPE=Debug -DFSANITIZE="address,leak,pointer-compare,pointer-subtract,undefined" -DMARFS_PREFIX=${{ env.DEP_INSTALL_PREFIX }}/marfs
 
     - name: Build
       run:  cmake --build ${{ github.workspace }}/build -j
 
     - name: Test
       working-directory: ${{ github.workspace }}/build
-      run:  ctest --output-on-failure
+      run:  ctest --output-on-failure -E "import|query_multiple_remotes"
 
   TSAN:
     needs: [ShellCheck, Pylint]
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@main
       with:
         fetch-depth: 0
         fetch-tags: true
 
-    - uses: actions/cache@v4
+    - uses: actions/cache@main
       with:
         path: ${{ env.DEP_INSTALL_PREFIX }}
         key:  ${{ runner.os }}-TSAN
@@ -270,26 +267,28 @@ jobs:
     - name: Install Python Packages
       run:  python3 -m pip install -r contrib/CI/requirements.txt
 
-    - name: Configure CMake
-      run:  cmake -B ${{ github.workspace }}/build ${{ env.COMMON_CONFIG }} -DCMAKE_BUILD_TYPE=Debug -DFSANITIZE="thread"
+    - name: Install Marfs & ISA-L
+      run:  contrib/deps/marfs.sh ${{ github.workspace }}/build/builds ${{ env.DEP_INSTALL_PREFIX }} 2
 
+    - name: Configure CMake
+      run:  cmake -B ${{ github.workspace }}/build ${{ env.COMMON_CONFIG }} -DCMAKE_BUILD_TYPE=Debug -DFSANITIZE="thread" -DMARFS_PREFIX=${{ env.DEP_INSTALL_PREFIX }}/marfs
     - name: Build
       run:  cmake --build ${{ github.workspace }}/build -j
 
     - name: Test
       working-directory: ${{ github.workspace }}/build
-      run:  ctest --output-on-failure -E "vt|dsi"
+      run:  ctest --output-on-failure -E "dsi|import|query_multiple_remotes|vt"
 
   Memcheck:
     needs: [ShellCheck, Pylint]
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@main
       with:
         fetch-depth: 0
         fetch-tags: true
 
-    - uses: actions/cache@v4
+    - uses: actions/cache@main
       with:
         path: ${{ env.DEP_INSTALL_PREFIX }}
         key:  ${{ runner.os }}-memcheck
@@ -303,8 +302,11 @@ jobs:
     - name: Install Python Packages
       run:  python3 -m pip install -r contrib/CI/requirements.txt
 
+    - name: Install Marfs & ISA-L
+      run:  contrib/deps/marfs.sh ${{ github.workspace }}/build/builds ${{ env.DEP_INSTALL_PREFIX }} 2
+
     - name: Configure CMake
-      run:  cmake -B ${{ github.workspace }}/build ${{ env.COMMON_CONFIG }}
+      run:  cmake -B ${{ github.workspace }}/build ${{ env.COMMON_CONFIG }} -DMARFS_PREFIX=${{ env.DEP_INSTALL_PREFIX }}/marfs
 
     - name: Build
       run:  cmake --build ${{ github.workspace }}/build -j
@@ -316,12 +318,12 @@ jobs:
     needs: [ShellCheck, Pylint]
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@main
       with:
         fetch-depth: 0
         fetch-tags: true
 
-    - uses: actions/cache@v4
+    - uses: actions/cache@main
       with:
         path: ${{ env.DEP_INSTALL_PREFIX }}
         key:  ${{ runner.os }}-without-jemalloc
@@ -332,8 +334,11 @@ jobs:
     - name: Install Python Packages
       run:  python3 -m pip install -r contrib/CI/requirements.txt
 
+    - name: Install Marfs & ISA-L
+      run:  contrib/deps/marfs.sh ${{ github.workspace }}/build/builds ${{ env.DEP_INSTALL_PREFIX }} 2
+
     - name: Configure CMake
-      run:  cmake -B ${{ github.workspace }}/build ${{ env.COMMON_CONFIG }} -DDEP_USE_JEMALLOC=Off -DTEST_WORKING_DIRECTORY="$(pwd)"
+      run:  cmake -B ${{ github.workspace }}/build ${{ env.COMMON_CONFIG }} -DDEP_USE_JEMALLOC=Off -DTEST_WORKING_DIRECTORY="$(pwd)" -DMARFS_PREFIX=${{ env.DEP_INSTALL_PREFIX }}/marfs
 
     - name: Build
       run:  cmake --build ${{ github.workspace }}/build -j
