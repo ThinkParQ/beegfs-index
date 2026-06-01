@@ -74,8 +74,6 @@ int beegfs_plugin_insert_rst_ids(const struct beegfs_entry_metadata *metadata,
                                  sqlite3_stmt *rst_stmt,
                                  int64_t entry_rowid);
 
-const char *beegfs_pattern_type_string(unsigned pattern_type);
-int beegfs_register_query_udfs(sqlite3 *db);
 int beegfs_create_query_views(sqlite3 *db);
 
 #endif

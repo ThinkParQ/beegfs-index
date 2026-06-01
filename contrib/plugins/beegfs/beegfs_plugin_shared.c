@@ -33,13 +33,11 @@ int beegfs_collect_metadata(int dirfd, const PCS_t *pcs, struct beegfs_entry_met
     metadata->inode = (uint64_t) pcs->work->statuso.st_ino;
 
     struct BeegfsIoctl_GetEntryInfoV2_Arg arg;
-    const int ok = beegfs_getEntryInfoV2(dirfd, metadata->name, &arg);
-
-    if (!ok) {
+    if (!beegfs_getEntryInfoV2(dirfd, metadata->name, &arg)) {
         return 1;
     }
 
-    /* Basic fields are always valid when the ioctl succeeds */
+    /* Basic fields are always valid when the ioctl succeeds. */
     metadata->got_info        = 1;
     metadata->owner_id        = arg.ownerID;
     metadata->entry_type      = arg.entryType;
@@ -47,13 +45,11 @@ int beegfs_collect_metadata(int dirfd, const PCS_t *pcs, struct beegfs_entry_met
     strncpy(metadata->parent_entry_id, arg.parentEntryID, sizeof(metadata->parent_entry_id) - 1);
     strncpy(metadata->entry_id,        arg.entryID,       sizeof(metadata->entry_id) - 1);
 
+    /* Non-zero getEntryInfoResult: meta-side RPC failed, only basic fields valid. */
     if (arg.getEntryInfoResult != 0) {
-        /* Partial result: GetEntryInfo RPC failed on meta side; stripe pattern,
-         * PathInfo, RST, and session data are unavailable. */
         return 0;
     }
 
-    /* Full result: copy stripe/PathInfo/RST/session fields */
     metadata->got_stripe_info     = 1;
     metadata->pattern_type        = arg.patternType;
     metadata->chunk_size          = arg.chunkSize;
@@ -61,30 +57,21 @@ int beegfs_collect_metadata(int dirfd, const PCS_t *pcs, struct beegfs_entry_met
     metadata->default_num_targets = arg.defaultNumTargets;
     metadata->num_targets         = arg.numTargets;
 
-    uint16_t n = (arg.numTargets < BEEGFS_PLUGIN_MAX_STRIPE_TARGETS)
-                 ? arg.numTargets
-                 : BEEGFS_PLUGIN_MAX_STRIPE_TARGETS;
+    uint16_t n = arg.numTargets < BEEGFS_PLUGIN_MAX_STRIPE_TARGETS ? arg.numTargets : BEEGFS_PLUGIN_MAX_STRIPE_TARGETS;
     memcpy(metadata->stripe_target_ids, arg.stripeTargetIDs, n * sizeof(uint16_t));
 
-    /* PathInfo */
-    metadata->path_info_flags    = arg.pathInfoFlags;
-    metadata->orig_parent_uid    = arg.origParentUID;
-    strncpy(metadata->orig_parent_entry_id, arg.origParentEntryID,
-            sizeof(metadata->orig_parent_entry_id) - 1);
+    metadata->path_info_flags      = arg.pathInfoFlags;
+    metadata->orig_parent_uid      = arg.origParentUID;
+    strncpy(metadata->orig_parent_entry_id, arg.origParentEntryID, sizeof(metadata->orig_parent_entry_id) - 1);
 
-    /* File data state (online/offline/tiered) */
-    metadata->file_data_state    = arg.fileDataState;
-
-    /* RST */
-    metadata->rst_major_version  = arg.rstMajorVersion;
-    metadata->rst_minor_version  = arg.rstMinorVersion;
+    metadata->file_data_state      = arg.fileDataState;
+    metadata->rst_major_version    = arg.rstMajorVersion;
+    metadata->rst_minor_version    = arg.rstMinorVersion;
     metadata->rst_cool_down_period = arg.rstCoolDownPeriod;
-    metadata->rst_file_policies  = arg.rstFilePolicies;
-    metadata->num_rst_ids        = arg.numRSTIds;
+    metadata->rst_file_policies    = arg.rstFilePolicies;
+    metadata->num_rst_ids          = arg.numRSTIds;
 
-    uint32_t nr = (arg.numRSTIds < BEEGFS_PLUGIN_MAX_STRIPE_TARGETS)
-                  ? arg.numRSTIds
-                  : BEEGFS_PLUGIN_MAX_STRIPE_TARGETS;
+    uint32_t nr = arg.numRSTIds < BEEGFS_PLUGIN_MAX_STRIPE_TARGETS ? arg.numRSTIds : BEEGFS_PLUGIN_MAX_STRIPE_TARGETS;
     memcpy(metadata->rst_ids, arg.rstIds, nr * sizeof(uint32_t));
 
     return 0;
@@ -93,95 +80,37 @@ int beegfs_collect_metadata(int dirfd, const PCS_t *pcs, struct beegfs_entry_met
 int beegfs_plugin_create_tables(sqlite3 *db) {
     static const char SQL[] =
         "CREATE TABLE IF NOT EXISTS " BEEGFS_PLUGIN_ENTRIES_TABLE " ("
-        "id INTEGER PRIMARY KEY AUTOINCREMENT, "
-        "name TEXT NOT NULL, "
-        "type TEXT NOT NULL, "
-        "inode INTEGER NOT NULL, "
-        "owner_id INTEGER, "
-        "parent_entry_id TEXT, "
-        "entry_id TEXT, "
-        "entry_type INTEGER, "
-        "feature_flags INTEGER, "
-        "stripe_pattern_type INTEGER, "
-        "stripe_chunk_size INTEGER, "
-        "stripe_num_targets INTEGER, "
-        "stripe_default_num_targets INTEGER, "
-        "storage_pool_id INTEGER, "
-        "path_info_flags INTEGER, "
-        "orig_parent_uid INTEGER, "
-        "orig_parent_entry_id TEXT, "
-        "file_data_state INTEGER, "
-        "rst_major_version INTEGER, "
-        "rst_minor_version INTEGER, "
-        "rst_cool_down_period INTEGER, "
-        "rst_file_policies INTEGER, "
-        "num_rst_ids INTEGER"
-        ");"
-        "CREATE INDEX IF NOT EXISTS beegfs_entries_inode_idx ON "
-            BEEGFS_PLUGIN_ENTRIES_TABLE "(inode);"
-        "CREATE INDEX IF NOT EXISTS beegfs_entries_entry_id_idx ON "
-            BEEGFS_PLUGIN_ENTRIES_TABLE "(entry_id);"
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, type TEXT NOT NULL, inode INTEGER NOT NULL, "
+        "owner_id INTEGER, parent_entry_id TEXT, entry_id TEXT, entry_type INTEGER, feature_flags INTEGER, "
+        "stripe_pattern_type INTEGER, stripe_chunk_size INTEGER, stripe_num_targets INTEGER, "
+        "stripe_default_num_targets INTEGER, storage_pool_id INTEGER, path_info_flags INTEGER, "
+        "orig_parent_uid INTEGER, orig_parent_entry_id TEXT, file_data_state INTEGER, "
+        "rst_major_version INTEGER, rst_minor_version INTEGER, rst_cool_down_period INTEGER, "
+        "rst_file_policies INTEGER, num_rst_ids INTEGER);"
+        "CREATE INDEX IF NOT EXISTS beegfs_entries_inode_idx ON " BEEGFS_PLUGIN_ENTRIES_TABLE "(inode);"
+        "CREATE INDEX IF NOT EXISTS beegfs_entries_entry_id_idx ON " BEEGFS_PLUGIN_ENTRIES_TABLE "(entry_id);"
         "CREATE TABLE IF NOT EXISTS " BEEGFS_PLUGIN_TARGETS_TABLE " ("
-        "entry_rowid INTEGER NOT NULL, "
-        "target_index INTEGER NOT NULL, "
-        "target_or_group INTEGER NOT NULL, "
-        "PRIMARY KEY (entry_rowid, target_index)"
-        ");"
+        "entry_rowid INTEGER NOT NULL, target_index INTEGER NOT NULL, target_or_group INTEGER NOT NULL, "
+        "PRIMARY KEY (entry_rowid, target_index));"
         "CREATE TABLE IF NOT EXISTS " BEEGFS_PLUGIN_RST_TABLE " ("
-        "entry_rowid INTEGER NOT NULL, "
-        "rst_index INTEGER NOT NULL, "
-        "rst_id INTEGER NOT NULL, "
-        "PRIMARY KEY (entry_rowid, rst_index)"
-        ");"
-        "CREATE VIEW IF NOT EXISTS " BEEGFS_PLUGIN_FILE_VIEW " AS "
-        "SELECT "
-            "e.id AS beegfs_rowid, "
-            "e.name, "
-            "e.type, "
-            "e.inode, "
-            "e.owner_id, "
-            "e.parent_entry_id, "
-            "e.entry_id, "
-            "e.entry_type, "
-            "e.feature_flags, "
-            "e.stripe_pattern_type, "
-            "CASE e.stripe_pattern_type "
-                "WHEN 1 THEN 'RAID0' "
-                "WHEN 2 THEN 'RAID10' "
-                "WHEN 3 THEN 'BUDDYMIRROR' "
-                "WHEN 0 THEN 'INVALID' "
-                "ELSE 'UNKNOWN' "
-            "END AS stripe_pattern_name, "
-            "e.stripe_chunk_size, "
-            "e.stripe_num_targets, "
-            "e.stripe_default_num_targets, "
-            "e.storage_pool_id, "
-            "e.path_info_flags, "
-            "e.orig_parent_uid, "
-            "e.orig_parent_entry_id, "
-            "e.file_data_state, "
-            "e.rst_major_version, "
-            "e.rst_minor_version, "
-            "e.rst_cool_down_period, "
-            "e.rst_file_policies, "
-            "e.num_rst_ids "
-        "FROM " BEEGFS_PLUGIN_ENTRIES_TABLE " AS e "
-        "WHERE e.type == 'f';"
-        "CREATE VIEW IF NOT EXISTS " BEEGFS_PLUGIN_FILE_TARGETS_VIEW " AS "
-        "SELECT "
-            "e.id AS beegfs_rowid, "
-            "e.name, "
-            "e.inode, "
-            "t.target_index, "
-            "t.target_or_group "
-        "FROM " BEEGFS_PLUGIN_ENTRIES_TABLE " AS e "
-        "JOIN " BEEGFS_PLUGIN_TARGETS_TABLE " AS t "
-        "ON t.entry_rowid == e.id "
-        "WHERE e.type == 'f';";
+        "entry_rowid INTEGER NOT NULL, rst_index INTEGER NOT NULL, rst_id INTEGER NOT NULL, "
+        "PRIMARY KEY (entry_rowid, rst_index));"
+        "CREATE VIEW IF NOT EXISTS " BEEGFS_PLUGIN_FILE_VIEW " AS SELECT "
+        "e.id AS beegfs_rowid, e.name, e.type, e.inode, e.owner_id, e.parent_entry_id, e.entry_id, "
+        "e.entry_type, e.feature_flags, e.stripe_pattern_type, "
+        "CASE e.stripe_pattern_type WHEN 1 THEN 'RAID0' WHEN 2 THEN 'RAID10' WHEN 3 THEN 'BUDDYMIRROR' "
+        "WHEN 0 THEN 'INVALID' ELSE 'UNKNOWN' END AS stripe_pattern_name, "
+        "e.stripe_chunk_size, e.stripe_num_targets, e.stripe_default_num_targets, e.storage_pool_id, "
+        "e.path_info_flags, e.orig_parent_uid, e.orig_parent_entry_id, e.file_data_state, "
+        "e.rst_major_version, e.rst_minor_version, e.rst_cool_down_period, e.rst_file_policies, e.num_rst_ids "
+        "FROM " BEEGFS_PLUGIN_ENTRIES_TABLE " AS e WHERE e.type == 'f';"
+        "CREATE VIEW IF NOT EXISTS " BEEGFS_PLUGIN_FILE_TARGETS_VIEW " AS SELECT "
+        "e.id AS beegfs_rowid, e.name, e.inode, t.target_index, t.target_or_group "
+        "FROM " BEEGFS_PLUGIN_ENTRIES_TABLE " AS e JOIN " BEEGFS_PLUGIN_TARGETS_TABLE " AS t "
+        "ON t.entry_rowid == e.id WHERE e.type == 'f';";
 
     char *err = NULL;
-    const int rc = sqlite3_exec(db, SQL, NULL, NULL, &err);
-    if (rc != SQLITE_OK) {
+    if (sqlite3_exec(db, SQL, NULL, NULL, &err) != SQLITE_OK) {
         fprintf(stderr, "beegfs plugin: failed to create tables: %s\n", err ? err : "(unknown)");
         sqlite3_free(err);
         return 1;
@@ -205,40 +134,32 @@ int beegfs_plugin_prepare_index_statements(sqlite3 *db,
     static const char INSERT_ENTRIES[] =
         "INSERT INTO " BEEGFS_PLUGIN_ENTRIES_TABLE " ("
         "name, type, inode, owner_id, parent_entry_id, entry_id, entry_type, feature_flags, "
-        "stripe_pattern_type, stripe_chunk_size, stripe_num_targets, "
-        "stripe_default_num_targets, storage_pool_id, "
-        "path_info_flags, orig_parent_uid, orig_parent_entry_id, "
-        "file_data_state, "
+        "stripe_pattern_type, stripe_chunk_size, stripe_num_targets, stripe_default_num_targets, "
+        "storage_pool_id, path_info_flags, orig_parent_uid, orig_parent_entry_id, file_data_state, "
         "rst_major_version, rst_minor_version, rst_cool_down_period, rst_file_policies, num_rst_ids"
         ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);";
 
     if (sqlite3_prepare_v2(db, INSERT_ENTRIES, -1, entries_stmt, NULL) != SQLITE_OK) {
-        fprintf(stderr, "beegfs plugin: failed to prepare entries statement: %s\n",
-                sqlite3_errmsg(db));
+        fprintf(stderr, "beegfs plugin: failed to prepare entries statement: %s\n", sqlite3_errmsg(db));
         return 1;
     }
 
     static const char INSERT_TARGETS[] =
-        "INSERT INTO " BEEGFS_PLUGIN_TARGETS_TABLE " ("
-        "entry_rowid, target_index, target_or_group"
-        ") VALUES (?, ?, ?);";
+        "INSERT INTO " BEEGFS_PLUGIN_TARGETS_TABLE " (entry_rowid, target_index, target_or_group) "
+        "VALUES (?, ?, ?);";
 
     if (sqlite3_prepare_v2(db, INSERT_TARGETS, -1, targets_stmt, NULL) != SQLITE_OK) {
-        fprintf(stderr, "beegfs plugin: failed to prepare targets statement: %s\n",
-                sqlite3_errmsg(db));
+        fprintf(stderr, "beegfs plugin: failed to prepare targets statement: %s\n", sqlite3_errmsg(db));
         sqlite3_finalize(*entries_stmt);
         *entries_stmt = NULL;
         return 1;
     }
 
     static const char INSERT_RST[] =
-        "INSERT INTO " BEEGFS_PLUGIN_RST_TABLE " ("
-        "entry_rowid, rst_index, rst_id"
-        ") VALUES (?, ?, ?);";
+        "INSERT INTO " BEEGFS_PLUGIN_RST_TABLE " (entry_rowid, rst_index, rst_id) VALUES (?, ?, ?);";
 
     if (sqlite3_prepare_v2(db, INSERT_RST, -1, rst_stmt, NULL) != SQLITE_OK) {
-        fprintf(stderr, "beegfs plugin: failed to prepare RST statement: %s\n",
-                sqlite3_errmsg(db));
+        fprintf(stderr, "beegfs plugin: failed to prepare RST statement: %s\n", sqlite3_errmsg(db));
         sqlite3_finalize(*targets_stmt);
         *targets_stmt = NULL;
         sqlite3_finalize(*entries_stmt);
@@ -274,11 +195,11 @@ int beegfs_plugin_insert_metadata(sqlite3_stmt *entries_stmt,
     sqlite3_bind_int64(entries_stmt, 3, (sqlite3_int64) metadata->inode);
 
     if (metadata->got_info) {
-        sqlite3_bind_int64(entries_stmt, 4,  (sqlite3_int64) metadata->owner_id);
-        sqlite3_bind_text(entries_stmt,  5,  metadata->parent_entry_id, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(entries_stmt,  6,  metadata->entry_id, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_int(entries_stmt,   7,  metadata->entry_type);
-        sqlite3_bind_int(entries_stmt,   8,  metadata->feature_flags);
+        sqlite3_bind_int64(entries_stmt, 4, (sqlite3_int64) metadata->owner_id);
+        sqlite3_bind_text(entries_stmt,  5, metadata->parent_entry_id, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(entries_stmt,  6, metadata->entry_id, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int(entries_stmt,   7, metadata->entry_type);
+        sqlite3_bind_int(entries_stmt,   8, metadata->feature_flags);
     } else {
         for (int i = 4; i <= 8; i++) {
             sqlite3_bind_null(entries_stmt, i);
@@ -366,114 +287,34 @@ int beegfs_plugin_insert_rst_ids(const struct beegfs_entry_metadata *metadata,
     return 0;
 }
 
-const char *beegfs_pattern_type_string(unsigned pattern_type) {
-    switch (pattern_type) {
-        case BEEGFS_STRIPEPATTERN_RAID0:
-            return "RAID0";
-        case BEEGFS_STRIPEPATTERN_RAID10:
-            return "RAID10";
-        case BEEGFS_STRIPEPATTERN_BUDDYMIRROR:
-            return "BUDDYMIRROR";
-        case BEEGFS_STRIPEPATTERN_INVALID:
-            return "INVALID";
-        default:
-            return "UNKNOWN";
-    }
-}
-
-static void udf_beegfs_pattern_type_name(sqlite3_context *context, int argc, sqlite3_value **argv) {
-    (void) argc;
-
-    if (sqlite3_value_type(argv[0]) == SQLITE_NULL) {
-        sqlite3_result_null(context);
-        return;
-    }
-
-    sqlite3_result_text(context,
-                        beegfs_pattern_type_string((unsigned) sqlite3_value_int64(argv[0])),
-                        -1, SQLITE_STATIC);
-}
-
-int beegfs_register_query_udfs(sqlite3 *db) {
-    if (!db) {
-        return 1;
-    }
-
-    const int rc = sqlite3_create_function_v2(db,
-                                              "beegfs_pattern_type_name",
-                                              1,
-                                              SQLITE_UTF8 | SQLITE_DETERMINISTIC,
-                                              NULL,
-                                              udf_beegfs_pattern_type_name,
-                                              NULL,
-                                              NULL,
-                                              NULL);
-    if (rc != SQLITE_OK) {
-        fprintf(stderr, "beegfs plugin: failed to register query UDFs: %s\n",
-                sqlite3_errmsg(db));
-        return 1;
-    }
-
-    return 0;
-}
-
 int beegfs_create_query_views(sqlite3 *db) {
     if (!db) {
         return 1;
     }
 
-    /*
-     * Query traversal attaches each directory db as "tree".
-     * If present, use the persistent views created by the index plugin and
-     * avoid extra work in per-directory ctx_init.
-     */
+    /* Real query traversal attaches each directory db as "tree"; the index
+     * plugin's persistent views already exist there, so nothing to do. */
     if (sqlite3_db_filename(db, "tree")) {
         return 0;
     }
 
-    /*
-     * gufi_query/gufi_vt type checking uses in-memory dbs without "tree".
-     * Provide schema-only stubs so SQL validation succeeds there.
-     */
+    /* gufi_query/gufi_vt type checking uses in-memory dbs with no "tree"
+     * attached; provide schema-only stubs so SQL validation succeeds. */
     static const char STUB_SQL[] =
         "CREATE TEMP TABLE IF NOT EXISTS " BEEGFS_PLUGIN_FILE_VIEW " ("
-            "beegfs_rowid INTEGER, "
-            "name TEXT, "
-            "type TEXT, "
-            "inode INTEGER, "
-            "owner_id INTEGER, "
-            "parent_entry_id TEXT, "
-            "entry_id TEXT, "
-            "entry_type INTEGER, "
-            "feature_flags INTEGER, "
-            "stripe_pattern_type INTEGER, "
-            "stripe_pattern_name TEXT, "
-            "stripe_chunk_size INTEGER, "
-            "stripe_num_targets INTEGER, "
-            "stripe_default_num_targets INTEGER, "
-            "storage_pool_id INTEGER, "
-            "path_info_flags INTEGER, "
-            "orig_parent_uid INTEGER, "
-            "orig_parent_entry_id TEXT, "
-            "file_data_state INTEGER, "
-            "rst_major_version INTEGER, "
-            "rst_minor_version INTEGER, "
-            "rst_cool_down_period INTEGER, "
-            "rst_file_policies INTEGER, "
-            "num_rst_ids INTEGER"
-        ");"
+        "beegfs_rowid INTEGER, name TEXT, type TEXT, inode INTEGER, owner_id INTEGER, parent_entry_id TEXT, "
+        "entry_id TEXT, entry_type INTEGER, feature_flags INTEGER, stripe_pattern_type INTEGER, "
+        "stripe_pattern_name TEXT, stripe_chunk_size INTEGER, stripe_num_targets INTEGER, "
+        "stripe_default_num_targets INTEGER, storage_pool_id INTEGER, path_info_flags INTEGER, "
+        "orig_parent_uid INTEGER, orig_parent_entry_id TEXT, file_data_state INTEGER, "
+        "rst_major_version INTEGER, rst_minor_version INTEGER, rst_cool_down_period INTEGER, "
+        "rst_file_policies INTEGER, num_rst_ids INTEGER);"
         "CREATE TEMP TABLE IF NOT EXISTS " BEEGFS_PLUGIN_FILE_TARGETS_VIEW " ("
-            "beegfs_rowid INTEGER, "
-            "name TEXT, "
-            "inode INTEGER, "
-            "target_index INTEGER, "
-            "target_or_group INTEGER"
-        ");";
+        "beegfs_rowid INTEGER, name TEXT, inode INTEGER, target_index INTEGER, target_or_group INTEGER);";
 
     char *err = NULL;
     if (sqlite3_exec(db, STUB_SQL, NULL, NULL, &err) != SQLITE_OK) {
-        fprintf(stderr, "beegfs plugin: failed to create query stubs: %s\n",
-                err ? err : sqlite3_errmsg(db));
+        fprintf(stderr, "beegfs plugin: failed to create query stubs: %s\n", err ? err : sqlite3_errmsg(db));
         sqlite3_free(err);
         return 1;
     }
