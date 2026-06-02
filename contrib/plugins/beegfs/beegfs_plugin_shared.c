@@ -1,6 +1,7 @@
 #include "beegfs_plugin_shared.h"
 
 #include <fcntl.h>
+#include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -80,7 +81,7 @@ int beegfs_collect_metadata(int dirfd, const PCS_t *pcs, struct beegfs_entry_met
 int beegfs_plugin_create_tables(sqlite3 *db) {
     static const char SQL[] =
         "CREATE TABLE IF NOT EXISTS " BEEGFS_PLUGIN_ENTRIES_TABLE " ("
-        "id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, type TEXT NOT NULL, inode INTEGER NOT NULL, "
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, type TEXT NOT NULL, inode TEXT NOT NULL, "
         "owner_id INTEGER, parent_entry_id TEXT, entry_id TEXT, entry_type INTEGER, feature_flags INTEGER, "
         "stripe_pattern_type INTEGER, stripe_chunk_size INTEGER, stripe_num_targets INTEGER, "
         "stripe_default_num_targets INTEGER, storage_pool_id INTEGER, path_info_flags INTEGER, "
@@ -189,10 +190,12 @@ int beegfs_plugin_insert_metadata(sqlite3_stmt *entries_stmt,
     sqlite3_clear_bindings(entries_stmt);
 
     char type_str[2] = { metadata->type, '\0' };
+    char inode_str[21];
+    snprintf(inode_str, sizeof(inode_str), "%" PRIu64, metadata->inode);
 
     sqlite3_bind_text(entries_stmt, 1, metadata->name, -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(entries_stmt, 2, type_str, -1, SQLITE_TRANSIENT);
-    sqlite3_bind_int64(entries_stmt, 3, (sqlite3_int64) metadata->inode);
+    sqlite3_bind_text(entries_stmt, 3, inode_str, -1, SQLITE_TRANSIENT);
 
     if (metadata->got_info) {
         sqlite3_bind_int64(entries_stmt, 4, (sqlite3_int64) metadata->owner_id);
@@ -302,7 +305,7 @@ int beegfs_create_query_views(sqlite3 *db) {
      * attached; provide schema-only stubs so SQL validation succeeds. */
     static const char STUB_SQL[] =
         "CREATE TEMP TABLE IF NOT EXISTS " BEEGFS_PLUGIN_FILE_VIEW " ("
-        "beegfs_rowid INTEGER, name TEXT, type TEXT, inode INTEGER, owner_id INTEGER, parent_entry_id TEXT, "
+        "beegfs_rowid INTEGER, name TEXT, type TEXT, inode TEXT, owner_id INTEGER, parent_entry_id TEXT, "
         "entry_id TEXT, entry_type INTEGER, feature_flags INTEGER, stripe_pattern_type INTEGER, "
         "stripe_pattern_name TEXT, stripe_chunk_size INTEGER, stripe_num_targets INTEGER, "
         "stripe_default_num_targets INTEGER, storage_pool_id INTEGER, path_info_flags INTEGER, "
@@ -310,7 +313,7 @@ int beegfs_create_query_views(sqlite3 *db) {
         "rst_major_version INTEGER, rst_minor_version INTEGER, rst_cool_down_period INTEGER, "
         "rst_file_policies INTEGER, num_rst_ids INTEGER);"
         "CREATE TEMP TABLE IF NOT EXISTS " BEEGFS_PLUGIN_FILE_TARGETS_VIEW " ("
-        "beegfs_rowid INTEGER, name TEXT, inode INTEGER, target_index INTEGER, target_or_group INTEGER);";
+        "beegfs_rowid INTEGER, name TEXT, inode TEXT, target_index INTEGER, target_or_group INTEGER);";
 
     char *err = NULL;
     if (sqlite3_exec(db, STUB_SQL, NULL, NULL, &err) != SQLITE_OK) {
