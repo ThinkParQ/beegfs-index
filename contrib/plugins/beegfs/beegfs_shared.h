@@ -1,5 +1,5 @@
-#ifndef BEEGFS_PLUGIN_SHARED_H
-#define BEEGFS_PLUGIN_SHARED_H
+#ifndef BEEGFS_SHARED_H
+#define BEEGFS_SHARED_H
 
 #include <stdint.h>
 
@@ -16,14 +16,18 @@
 /* Must match BEEGFS_IOCTL_MAX_STRIPE_TARGETS in bh_beegfs_ioctl.h */
 #define BEEGFS_PLUGIN_MAX_STRIPE_TARGETS 256
 
+#define BEEGFS_PLUGIN_ENTRYID_MAXLEN 26
+
+#define BEEGFS_PLUGIN_FILENAME_MAXLEN 256
+
 struct beegfs_entry_metadata {
-    const char *name;
+    char name[BEEGFS_PLUGIN_FILENAME_MAXLEN];
     char type;
     uint64_t inode;
 
     uint32_t owner_id;
-    char parent_entry_id[27];
-    char entry_id[27];
+    char parent_entry_id[BEEGFS_PLUGIN_ENTRYID_MAXLEN + 1];
+    char entry_id[BEEGFS_PLUGIN_ENTRYID_MAXLEN + 1];
     int entry_type;
     int feature_flags;
 
@@ -37,7 +41,7 @@ struct beegfs_entry_metadata {
     /* PathInfo */
     uint32_t path_info_flags;
     uint32_t orig_parent_uid;
-    char orig_parent_entry_id[27];
+    char orig_parent_entry_id[BEEGFS_PLUGIN_ENTRYID_MAXLEN + 1];
 
     /* File data state (online/offline/tiered) */
     uint8_t  file_data_state;
@@ -54,6 +58,7 @@ struct beegfs_entry_metadata {
     int got_stripe_info; /* stripe/PathInfo/RST/session fields are valid */
 };
 
+/* Returns 0 on success and a negative value on error. */
 int beegfs_collect_metadata(int dirfd, const PCS_t *pcs, struct beegfs_entry_metadata *metadata);
 
 int beegfs_plugin_create_tables(sqlite3 *db);

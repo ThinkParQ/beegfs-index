@@ -203,8 +203,8 @@ endif()
 set_target_properties(gufi_query PROPERTIES ENABLE_EXPORTS TRUE)
 install(TARGETS gufi_query DESTINATION bin/index)
 
-foreach(_plugin beegfs_index_plugin beegfs_query_plugin)
-  add_library(${_plugin} SHARED "${BEEGFS_SRC}/${_plugin}.c" "${BEEGFS_SRC}/beegfs_plugin_shared.c")
+foreach(_plugin beegfs_indexing beegfs_querying)
+  add_library(${_plugin} SHARED "${BEEGFS_SRC}/${_plugin}.c" "${BEEGFS_SRC}/beegfs_shared.c")
   add_dependencies(${_plugin} install_dependencies)
   target_link_libraries(${_plugin} "${DEP_INSTALL_PREFIX}/sqlite3/lib/libsqlite3.${EXT}")
   set_target_properties(${_plugin} PROPERTIES

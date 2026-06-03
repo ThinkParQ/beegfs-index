@@ -1,7 +1,9 @@
-#include "beegfs_plugin_shared.h"
+#include "beegfs_shared.h"
 
 #include <fcntl.h>
 #include <inttypes.h>
+#include <libgen.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -10,32 +12,33 @@
 #include "bf.h"
 #include "bh_beegfs_ioctl.h"
 
-static const char *basename_from_work(const struct work *work) {
-    if (!work || !work->name) {
-        return "";
-    }
-
-    if (work->basename_len > work->name_len) {
-        return work->name;
-    }
-
-    return work->name + work->name_len - work->basename_len;
-}
-
 int beegfs_collect_metadata(int dirfd, const PCS_t *pcs, struct beegfs_entry_metadata *metadata) {
     if (dirfd < 0 || !pcs || !pcs->work || !metadata) {
-        return 1;
+        return -1;
+    }
+
+    if (!pcs->work->name || (pcs->work->name_len == 0) ||
+        (pcs->work->name_len >= PATH_MAX)) {
+        return -1;
     }
 
     memset(metadata, 0, sizeof(*metadata));
 
-    metadata->name = basename_from_work(pcs->work);
+    char scratch[PATH_MAX];
+    memcpy(scratch, pcs->work->name, pcs->work->name_len + 1);
+
+    const char *bn = basename(scratch);
+    if (!bn || !bn[0] || (strlen(bn) >= sizeof(metadata->name))) {
+        return -1;
+    }
+    strncpy(metadata->name, bn, sizeof(metadata->name) - 1);
+
     metadata->type = (pcs->ed && pcs->ed->type) ? pcs->ed->type : '?';
     metadata->inode = (uint64_t) pcs->work->statuso.st_ino;
 
     struct BeegfsIoctl_GetEntryInfoV2_Arg arg;
     if (!beegfs_getEntryInfoV2(dirfd, metadata->name, &arg)) {
-        return 1;
+        return -1;
     }
 
     /* Basic fields are always valid when the ioctl succeeds. */
@@ -43,6 +46,9 @@ int beegfs_collect_metadata(int dirfd, const PCS_t *pcs, struct beegfs_entry_met
     metadata->owner_id        = arg.ownerID;
     metadata->entry_type      = arg.entryType;
     metadata->feature_flags   = arg.featureFlags;
+    /* ID copies are capped at sizeof - 1, so the destinations' last byte is
+     * never written and stays '\0' from the memset above; the strings are
+     * always NUL-terminated even if a source were unterminated. */
     strncpy(metadata->parent_entry_id, arg.parentEntryID, sizeof(metadata->parent_entry_id) - 1);
     strncpy(metadata->entry_id,        arg.entryID,       sizeof(metadata->entry_id) - 1);
 

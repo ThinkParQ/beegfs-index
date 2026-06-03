@@ -104,8 +104,8 @@ $ make -j"$(nproc)"
 
 `BEEGFS_INDEX_VERSION` defaults to the current `git describe` tag if omitted.
 The BeeGFS plugins are built as
-`build/contrib/plugins/beegfs/libbeegfs_index_plugin.so` and
-`libbeegfs_query_plugin.so`.
+`build/contrib/plugins/beegfs/libbeegfs_indexing.so` and
+`libbeegfs_querying.so`.
 
 Useful options (append to the `cmake` line):
 - `-DCMAKE_BUILD_TYPE=Debug` — debug build (or `export BEEGFS_DEBUG=1`).

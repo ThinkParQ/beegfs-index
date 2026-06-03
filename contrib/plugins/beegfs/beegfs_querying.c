@@ -1,7 +1,7 @@
 #include <sqlite3.h>
 
 #include "bf.h"
-#include "beegfs_plugin_shared.h"
+#include "beegfs_shared.h"
 
 static int global_init(void *global) {
     (void) global;

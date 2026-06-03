@@ -1,10 +1,10 @@
 set(BEEGFS_PLUGIN_COMMON
-  beegfs_plugin_shared.c
+  beegfs_shared.c
 )
 
 set(BEEGFS_PLUGINS
-  beegfs_index_plugin
-  beegfs_query_plugin
+  beegfs_indexing
+  beegfs_querying
 )
 
 foreach(BEEGFS_PLUGIN ${BEEGFS_PLUGINS})
@@ -20,8 +20,8 @@ if (APPLE OR DARWIN)
   endforeach()
 elseif(CYGWIN)
   # Cygwin requires importing symbols from the executable's import libraries.
-  target_link_libraries(beegfs_index_plugin "${CMAKE_BINARY_DIR}/src/libgufi_dir2index.dll.a")
-  target_link_libraries(beegfs_query_plugin "${CMAKE_BINARY_DIR}/src/libgufi_query.dll.a")
+  target_link_libraries(beegfs_indexing "${CMAKE_BINARY_DIR}/src/libgufi_dir2index.dll.a")
+  target_link_libraries(beegfs_querying "${CMAKE_BINARY_DIR}/src/libgufi_query.dll.a")
 else()
   foreach(BEEGFS_PLUGIN ${BEEGFS_PLUGINS})
     target_link_libraries(${BEEGFS_PLUGIN} "${DEP_INSTALL_PREFIX}/sqlite3/lib/libsqlite3.${EXT}")
