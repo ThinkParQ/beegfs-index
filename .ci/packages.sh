@@ -4,7 +4,7 @@
 
 set -e -u -x
 
-pkgtype="${1}"
+pkgtype="${1:-}"
 CONCURRENCY="$(nproc)"
 
 # Only forward an explicit version. When BEEGFS_INDEX_VERSION is unset, CMake

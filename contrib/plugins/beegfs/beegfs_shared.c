@@ -12,6 +12,11 @@
 #include "bf.h"
 #include "bh_beegfs_ioctl.h"
 
+/* Clamp an untrusted ioctl count to its destination array capacity. The insert
+ * loops are bounded by the stored count, so storing an unclamped value would let
+ * a malformed count drive an out-of-bounds read of the fixed-size ID arrays. */
+#define BEEGFS_CLAMP_COUNT(count, cap) ((count) < (cap) ? (count) : (cap))
+
 int beegfs_collect_metadata(int dirfd, const PCS_t *pcs, struct beegfs_entry_metadata *metadata) {
     if (dirfd < 0 || !pcs || !pcs->work || !metadata) {
         return -1;
@@ -46,9 +51,8 @@ int beegfs_collect_metadata(int dirfd, const PCS_t *pcs, struct beegfs_entry_met
     metadata->owner_id        = arg.ownerID;
     metadata->entry_type      = arg.entryType;
     metadata->feature_flags   = arg.featureFlags;
-    /* ID copies are capped at sizeof - 1, so the destinations' last byte is
-     * never written and stays '\0' from the memset above; the strings are
-     * always NUL-terminated even if a source were unterminated. */
+    /* Cap at sizeof - 1; the last byte stays '\0' from the memset above, so the
+     * copies are NUL-terminated even if a source string were not. */
     strncpy(metadata->parent_entry_id, arg.parentEntryID, sizeof(metadata->parent_entry_id) - 1);
     strncpy(metadata->entry_id,        arg.entryID,       sizeof(metadata->entry_id) - 1);
 
@@ -62,9 +66,9 @@ int beegfs_collect_metadata(int dirfd, const PCS_t *pcs, struct beegfs_entry_met
     metadata->chunk_size          = arg.chunkSize;
     metadata->storage_pool_id     = arg.storagePoolId;
     metadata->default_num_targets = arg.defaultNumTargets;
-    metadata->num_targets         = arg.numTargets;
 
-    uint16_t n = arg.numTargets < BEEGFS_PLUGIN_MAX_STRIPE_TARGETS ? arg.numTargets : BEEGFS_PLUGIN_MAX_STRIPE_TARGETS;
+    uint16_t n = BEEGFS_CLAMP_COUNT(arg.numTargets, BEEGFS_PLUGIN_MAX_STRIPE_TARGETS);
+    metadata->num_targets = n;
     memcpy(metadata->stripe_target_ids, arg.stripeTargetIDs, n * sizeof(uint16_t));
 
     metadata->path_info_flags      = arg.pathInfoFlags;
@@ -76,9 +80,9 @@ int beegfs_collect_metadata(int dirfd, const PCS_t *pcs, struct beegfs_entry_met
     metadata->rst_minor_version    = arg.rstMinorVersion;
     metadata->rst_cool_down_period = arg.rstCoolDownPeriod;
     metadata->rst_file_policies    = arg.rstFilePolicies;
-    metadata->num_rst_ids          = arg.numRSTIds;
 
-    uint32_t nr = arg.numRSTIds < BEEGFS_PLUGIN_MAX_STRIPE_TARGETS ? arg.numRSTIds : BEEGFS_PLUGIN_MAX_STRIPE_TARGETS;
+    uint32_t nr = BEEGFS_CLAMP_COUNT(arg.numRSTIds, BEEGFS_PLUGIN_MAX_RST_IDS);
+    metadata->num_rst_ids = nr;
     memcpy(metadata->rst_ids, arg.rstIds, nr * sizeof(uint32_t));
 
     return 0;

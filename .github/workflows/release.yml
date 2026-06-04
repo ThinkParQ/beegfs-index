@@ -11,7 +11,7 @@ jobs:
   release:
     runs-on: ubuntu-latest
     env:
-      BEEGFS_INDEX_VERSION: ${{ github.event.inputs.version || github.ref_name }}
+      BEEGFS_INDEX_VERSION: ${{ github.ref_name }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -58,10 +58,12 @@ jobs:
           passphrase: ${{ secrets.PUBLICREPO_GPGPACKAGEPASSPHRASE }}
 
       - name: Sign checksums file
+        env:
+          GPG_PASSPHRASE: ${{ secrets.PUBLICREPO_GPGPACKAGEPASSPHRASE }}
         run: |
           cd packages
           export GPG_TTY=$(tty)
-          gpg --pinentry-mode loopback --passphrase ${{ secrets.PUBLICREPO_GPGPACKAGEPASSPHRASE }} \
+          printf '%s' "$GPG_PASSPHRASE" | gpg --pinentry-mode loopback --passphrase-fd 0 \
             --trust-model always --detach-sign -o checksums.txt.sig -r packages@beegfs.com checksums.txt
 
       - name: Create Release

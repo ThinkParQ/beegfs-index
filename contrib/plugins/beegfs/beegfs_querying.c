@@ -19,7 +19,7 @@ static void *ctx_init(void *ptr) {
         return NULL;
     }
 
-    beegfs_create_query_views(db);
+    (void) beegfs_create_query_views(db);
 
     return NULL;
 }

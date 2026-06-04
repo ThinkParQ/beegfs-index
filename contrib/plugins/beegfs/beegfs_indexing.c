@@ -1,5 +1,8 @@
+#include <errno.h>
 #include <fcntl.h>
+#include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
 
 #include "bf.h"
@@ -63,6 +66,8 @@ static void *ctx_init(void *ptr) {
     if (ctx) {
         ctx->dir_fd = open(pcs->work->name, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
         if (ctx->dir_fd < 0) {
+            fprintf(stderr, "beegfs plugin: cannot open directory %s: %s\n",
+                    pcs->work->name, strerror(errno));
             beegfs_index_ctx_destroy(ctx);
             ctx = NULL;
         }

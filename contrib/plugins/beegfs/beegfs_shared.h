@@ -13,8 +13,10 @@
 #define BEEGFS_PLUGIN_FILE_VIEW "beegfs_file_view"
 #define BEEGFS_PLUGIN_FILE_TARGETS_VIEW "beegfs_file_targets_view"
 
-/* Must match BEEGFS_IOCTL_MAX_STRIPE_TARGETS in bh_beegfs_ioctl.h */
+
 #define BEEGFS_PLUGIN_MAX_STRIPE_TARGETS 256
+
+#define BEEGFS_PLUGIN_MAX_RST_IDS 256
 
 #define BEEGFS_PLUGIN_ENTRYID_MAXLEN 26
 
@@ -52,7 +54,7 @@ struct beegfs_entry_metadata {
     uint16_t rst_cool_down_period;
     uint16_t rst_file_policies;
     uint32_t num_rst_ids;
-    uint32_t rst_ids[BEEGFS_PLUGIN_MAX_STRIPE_TARGETS];
+    uint32_t rst_ids[BEEGFS_PLUGIN_MAX_RST_IDS];
 
     int got_info;        /* basic fields (ownerID/entryID/type/flags) are valid */
     int got_stripe_info; /* stripe/PathInfo/RST/session fields are valid */
