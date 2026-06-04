@@ -220,6 +220,10 @@ install(DIRECTORY "${DEP_INSTALL_PREFIX}/sqlite3/lib/"
   PATTERN "pkgconfig" EXCLUDE
 )
 
+install(FILES "${GUFI_ROOT}/copyright"
+  DESTINATION share/doc/beegfs-index
+)
+
 if("${PACKAGE_TYPE}" STREQUAL "deb")
   find_program(DPKG dpkg REQUIRED)
   if(DEFINED DEB_ARCH AND NOT "${DEB_ARCH}" STREQUAL "")
@@ -263,6 +267,7 @@ elseif("${PACKAGE_TYPE}" STREQUAL "rpm")
   set(CPACK_RPM_PACKAGE_AUTOREQ      OFF)
   set(CPACK_RPM_PACKAGE_RELOCATABLE  ON)
   set(CPACK_RPM_FILE_NAME            "beegfs-index-${FILE_NAME_VERSION}.${ARCH}.rpm")
+  set(CPACK_RPM_USER_FILELIST        "%license ${CPACK_PACKAGING_INSTALL_PREFIX}/share/doc/beegfs-index/copyright")
   if(CROSS_COMPILE)
     # When cross-compiling, the host strip binary can't parse the target arch's ELF files.
     # Suppress rpmbuild's brp-strip post-install script to avoid a fatal packaging error.
