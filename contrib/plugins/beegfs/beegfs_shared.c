@@ -45,6 +45,16 @@ int beegfs_collect_metadata(int dirfd, const PCS_t *pcs, struct beegfs_entry_met
     if (!beegfs_getEntryInfoV2(dirfd, metadata->name, &arg)) {
         return -1;
     }
+    switch (arg.getEntryInfoResult) {
+        case 0:
+        case 2: case 3: case 4: case 5: case 10: case 16:
+        case 22: case 23: case 26: case 31: case 32:
+            break;
+        default:
+            fprintf(stderr, "beegfs plugin: %s: getEntryInfo failed (error %d)\n",
+                    metadata->name, (int) arg.getEntryInfoResult);
+            return -1;
+    }
 
     if (arg.entryID[0] != '\0') {
         metadata->got_info        = 1;
