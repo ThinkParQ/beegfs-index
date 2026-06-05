@@ -94,18 +94,23 @@ static void process_entry(void *ptr, void *user_data) {
         return;
     }
 
-    int64_t entry_rowid = 0;
-    if (beegfs_plugin_insert_metadata(ctx->entries_stmt, &metadata, &entry_rowid) != 0) {
+    sqlite3 *db = sqlite3_db_handle(ctx->entries_stmt);
+    if (sqlite3_exec(db, "SAVEPOINT beegfs_entry", NULL, NULL, NULL) != SQLITE_OK) {
         return;
     }
 
-    if (metadata.got_stripe_info && (metadata.num_targets > 0)) {
-        beegfs_plugin_insert_targets(&metadata, ctx->targets_stmt, entry_rowid);
+    int64_t entry_rowid = 0;
+    int ok = beegfs_plugin_insert_metadata(ctx->entries_stmt, &metadata, &entry_rowid) == 0;
+    if (ok && (metadata.num_targets > 0)) {
+        ok = beegfs_plugin_insert_targets(&metadata, ctx->targets_stmt, entry_rowid) == 0;
+    }
+    if (ok && (metadata.num_rst_ids > 0)) {
+        ok = beegfs_plugin_insert_rst_ids(&metadata, ctx->rst_stmt, entry_rowid) == 0;
     }
 
-    if (metadata.got_stripe_info && (metadata.num_rst_ids > 0)) {
-        beegfs_plugin_insert_rst_ids(&metadata, ctx->rst_stmt, entry_rowid);
-    }
+    sqlite3_exec(db, ok ? "RELEASE beegfs_entry"
+                        : "ROLLBACK TO beegfs_entry; RELEASE beegfs_entry",
+                 NULL, NULL, NULL);
 }
 
 static void ctx_exit(void *ptr, void *user_data) {

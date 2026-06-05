@@ -57,7 +57,7 @@ struct beegfs_entry_metadata {
     uint32_t rst_ids[BEEGFS_PLUGIN_MAX_RST_IDS];
 
     int got_info;        /* basic fields (ownerID/entryID/type/flags) are valid */
-    int got_stripe_info; /* stripe/PathInfo/RST/session fields are valid */
+    int got_stripe_info; /* stripe/PathInfo/RST fields are valid */
 };
 
 /* Returns 0 on success and a negative value on error. */

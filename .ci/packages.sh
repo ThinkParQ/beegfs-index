@@ -29,7 +29,7 @@ TARGET_ARCH="${TARGET_ARCH:-${NATIVE_ARCH}}"
 GLIBC_VERSION="${GLIBC_VERSION:-2.28}"
 
 if [ -x "/opt/zig/zig" ]; then
-    ZIG_WRAPPER="/tmp/zigcc-${TARGET_ARCH}"
+    ZIG_WRAPPER="$(mktemp -d)/zigcc-${TARGET_ARCH}"
     printf '#!/bin/sh\nexec /opt/zig/zig cc -target %s-linux-gnu.%s -fno-sanitize=all "$@"\n' \
         "${TARGET_ARCH}" "${GLIBC_VERSION}" > "${ZIG_WRAPPER}"
     chmod +x "${ZIG_WRAPPER}"
@@ -37,11 +37,11 @@ if [ -x "/opt/zig/zig" ]; then
 fi
 
 # Inject a wrapper features.h to pin __GLIBC_MINOR__ to the target version.
-# Without this, the host glibc headers redirect sscanf to __isoc23_sscanf
-# (unavailable in glibc < 2.29) when building with -D_GNU_SOURCE.
+# Without this, the host glibc headers redirect sscanf to a versioned symbol
+# (e.g. __isoc23_sscanf on glibc >= 2.38) that is absent from the older target
+# glibc we link against under -D_GNU_SOURCE.
 if [ -n "${CC:-}" ] && "${CC}" --version 2>/dev/null | grep -qi "zig"; then
-    GLIBC_FIX_DIR="/tmp/beegfs-glibc-fix"
-    mkdir -p "${GLIBC_FIX_DIR}"
+    GLIBC_FIX_DIR="$(mktemp -d)"
     GLIBC_MINOR=$(echo "${GLIBC_VERSION}" | cut -d. -f2)
     printf '#include_next <features.h>\n#undef __GLIBC_MINOR__\n#define __GLIBC_MINOR__ %s\n' \
         "${GLIBC_MINOR}" > "${GLIBC_FIX_DIR}/features.h"

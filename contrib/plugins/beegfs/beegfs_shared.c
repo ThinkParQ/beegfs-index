@@ -203,41 +203,48 @@ int beegfs_plugin_insert_metadata(sqlite3_stmt *entries_stmt,
     char inode_str[21];
     snprintf(inode_str, sizeof(inode_str), "%" PRIu64, metadata->inode);
 
-    sqlite3_bind_text(entries_stmt, 1, metadata->name, -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(entries_stmt, 2, type_str, -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(entries_stmt, 3, inode_str, -1, SQLITE_TRANSIENT);
+    int rc = 0;
+    rc |= sqlite3_bind_text(entries_stmt, 1, metadata->name, -1, SQLITE_TRANSIENT);
+    rc |= sqlite3_bind_text(entries_stmt, 2, type_str, -1, SQLITE_TRANSIENT);
+    rc |= sqlite3_bind_text(entries_stmt, 3, inode_str, -1, SQLITE_TRANSIENT);
 
     if (metadata->got_info) {
-        sqlite3_bind_int64(entries_stmt, 4, (sqlite3_int64) metadata->owner_id);
-        sqlite3_bind_text(entries_stmt,  5, metadata->parent_entry_id, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(entries_stmt,  6, metadata->entry_id, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_int(entries_stmt,   7, metadata->entry_type);
-        sqlite3_bind_int(entries_stmt,   8, metadata->feature_flags);
+        rc |= sqlite3_bind_int64(entries_stmt, 4, (sqlite3_int64) metadata->owner_id);
+        rc |= sqlite3_bind_text(entries_stmt,  5, metadata->parent_entry_id, -1, SQLITE_TRANSIENT);
+        rc |= sqlite3_bind_text(entries_stmt,  6, metadata->entry_id, -1, SQLITE_TRANSIENT);
+        rc |= sqlite3_bind_int(entries_stmt,   7, metadata->entry_type);
+        rc |= sqlite3_bind_int(entries_stmt,   8, metadata->feature_flags);
     } else {
         for (int i = 4; i <= 8; i++) {
-            sqlite3_bind_null(entries_stmt, i);
+            rc |= sqlite3_bind_null(entries_stmt, i);
         }
     }
 
     if (metadata->got_stripe_info) {
-        sqlite3_bind_int64(entries_stmt, 9,  (sqlite3_int64) metadata->pattern_type);
-        sqlite3_bind_int64(entries_stmt, 10, (sqlite3_int64) metadata->chunk_size);
-        sqlite3_bind_int64(entries_stmt, 11, (sqlite3_int64) metadata->num_targets);
-        sqlite3_bind_int64(entries_stmt, 12, (sqlite3_int64) metadata->default_num_targets);
-        sqlite3_bind_int64(entries_stmt, 13, (sqlite3_int64) metadata->storage_pool_id);
-        sqlite3_bind_int64(entries_stmt, 14, (sqlite3_int64) metadata->path_info_flags);
-        sqlite3_bind_int64(entries_stmt, 15, (sqlite3_int64) metadata->orig_parent_uid);
-        sqlite3_bind_text(entries_stmt,  16, metadata->orig_parent_entry_id, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_int(entries_stmt,   17, (int) metadata->file_data_state);
-        sqlite3_bind_int(entries_stmt,   18, (int) metadata->rst_major_version);
-        sqlite3_bind_int(entries_stmt,   19, (int) metadata->rst_minor_version);
-        sqlite3_bind_int(entries_stmt,   20, (int) metadata->rst_cool_down_period);
-        sqlite3_bind_int(entries_stmt,   21, (int) metadata->rst_file_policies);
-        sqlite3_bind_int64(entries_stmt, 22, (sqlite3_int64) metadata->num_rst_ids);
+        rc |= sqlite3_bind_int64(entries_stmt, 9,  (sqlite3_int64) metadata->pattern_type);
+        rc |= sqlite3_bind_int64(entries_stmt, 10, (sqlite3_int64) metadata->chunk_size);
+        rc |= sqlite3_bind_int64(entries_stmt, 11, (sqlite3_int64) metadata->num_targets);
+        rc |= sqlite3_bind_int64(entries_stmt, 12, (sqlite3_int64) metadata->default_num_targets);
+        rc |= sqlite3_bind_int64(entries_stmt, 13, (sqlite3_int64) metadata->storage_pool_id);
+        rc |= sqlite3_bind_int64(entries_stmt, 14, (sqlite3_int64) metadata->path_info_flags);
+        rc |= sqlite3_bind_int64(entries_stmt, 15, (sqlite3_int64) metadata->orig_parent_uid);
+        rc |= sqlite3_bind_text(entries_stmt,  16, metadata->orig_parent_entry_id, -1, SQLITE_TRANSIENT);
+        rc |= sqlite3_bind_int(entries_stmt,   17, (int) metadata->file_data_state);
+        rc |= sqlite3_bind_int(entries_stmt,   18, (int) metadata->rst_major_version);
+        rc |= sqlite3_bind_int(entries_stmt,   19, (int) metadata->rst_minor_version);
+        rc |= sqlite3_bind_int(entries_stmt,   20, (int) metadata->rst_cool_down_period);
+        rc |= sqlite3_bind_int(entries_stmt,   21, (int) metadata->rst_file_policies);
+        rc |= sqlite3_bind_int64(entries_stmt, 22, (sqlite3_int64) metadata->num_rst_ids);
     } else {
         for (int i = 9; i <= 22; i++) {
-            sqlite3_bind_null(entries_stmt, i);
+            rc |= sqlite3_bind_null(entries_stmt, i);
         }
+    }
+
+    if (rc != SQLITE_OK) {
+        fprintf(stderr, "beegfs plugin: failed to bind entry metadata: %s\n",
+                sqlite3_errmsg(sqlite3_db_handle(entries_stmt)));
+        return 1;
     }
 
     if (sqlite3_step(entries_stmt) != SQLITE_DONE) {
@@ -261,9 +268,15 @@ int beegfs_plugin_insert_targets(const struct beegfs_entry_metadata *metadata,
         sqlite3_reset(targets_stmt);
         sqlite3_clear_bindings(targets_stmt);
 
-        sqlite3_bind_int64(targets_stmt, 1, (sqlite3_int64) entry_rowid);
-        sqlite3_bind_int(targets_stmt,   2, i);
-        sqlite3_bind_int64(targets_stmt, 3, (sqlite3_int64) metadata->stripe_target_ids[i]);
+        int rc = 0;
+        rc |= sqlite3_bind_int64(targets_stmt, 1, (sqlite3_int64) entry_rowid);
+        rc |= sqlite3_bind_int(targets_stmt,   2, i);
+        rc |= sqlite3_bind_int64(targets_stmt, 3, (sqlite3_int64) metadata->stripe_target_ids[i]);
+        if (rc != SQLITE_OK) {
+            fprintf(stderr, "beegfs plugin: failed to bind stripe target metadata: %s\n",
+                    sqlite3_errmsg(sqlite3_db_handle(targets_stmt)));
+            return 1;
+        }
 
         if (sqlite3_step(targets_stmt) != SQLITE_DONE) {
             fprintf(stderr, "beegfs plugin: failed to insert stripe target metadata: %s\n",
@@ -286,9 +299,15 @@ int beegfs_plugin_insert_rst_ids(const struct beegfs_entry_metadata *metadata,
         sqlite3_reset(rst_stmt);
         sqlite3_clear_bindings(rst_stmt);
 
-        sqlite3_bind_int64(rst_stmt, 1, (sqlite3_int64) entry_rowid);
-        sqlite3_bind_int64(rst_stmt, 2, (sqlite3_int64) i);
-        sqlite3_bind_int64(rst_stmt, 3, (sqlite3_int64) metadata->rst_ids[i]);
+        int rc = 0;
+        rc |= sqlite3_bind_int64(rst_stmt, 1, (sqlite3_int64) entry_rowid);
+        rc |= sqlite3_bind_int64(rst_stmt, 2, (sqlite3_int64) i);
+        rc |= sqlite3_bind_int64(rst_stmt, 3, (sqlite3_int64) metadata->rst_ids[i]);
+        if (rc != SQLITE_OK) {
+            fprintf(stderr, "beegfs plugin: failed to bind RST id: %s\n",
+                    sqlite3_errmsg(sqlite3_db_handle(rst_stmt)));
+            return 1;
+        }
 
         if (sqlite3_step(rst_stmt) != SQLITE_DONE) {
             fprintf(stderr, "beegfs plugin: failed to insert RST id: %s\n",
