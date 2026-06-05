@@ -46,18 +46,19 @@ int beegfs_collect_metadata(int dirfd, const PCS_t *pcs, struct beegfs_entry_met
         return -1;
     }
 
-    /* Basic fields are always valid when the ioctl succeeds. */
-    metadata->got_info        = 1;
-    metadata->owner_id        = arg.ownerID;
-    metadata->entry_type      = arg.entryType;
-    metadata->feature_flags   = arg.featureFlags;
-    /* Cap at sizeof - 1; the last byte stays '\0' from the memset above, so the
-     * copies are NUL-terminated even if a source string were not. */
-    strncpy(metadata->parent_entry_id, arg.parentEntryID, sizeof(metadata->parent_entry_id) - 1);
-    strncpy(metadata->entry_id,        arg.entryID,       sizeof(metadata->entry_id) - 1);
+    if (arg.entryID[0] != '\0') {
+        metadata->got_info        = 1;
+        metadata->owner_id        = arg.ownerID;
+        metadata->entry_type      = arg.entryType;
+        metadata->feature_flags   = arg.featureFlags;
+        /* Cap at sizeof - 1; the last byte stays '\0' from the memset above, so
+         * the copies are NUL-terminated even if a source string were not. */
+        strncpy(metadata->parent_entry_id, arg.parentEntryID, sizeof(metadata->parent_entry_id) - 1);
+        strncpy(metadata->entry_id,        arg.entryID,       sizeof(metadata->entry_id) - 1);
+    }
 
-    /* Non-zero getEntryInfoResult: meta-side RPC failed, only basic fields valid. */
-    if (arg.getEntryInfoResult != 0) {
+
+    if (!metadata->got_info || arg.getEntryInfoResult != 0) {
         return 0;
     }
 
@@ -124,7 +125,7 @@ int beegfs_plugin_create_tables(sqlite3 *db) {
     if (sqlite3_exec(db, SQL, NULL, NULL, &err) != SQLITE_OK) {
         fprintf(stderr, "beegfs plugin: failed to create tables: %s\n", err ? err : "(unknown)");
         sqlite3_free(err);
-        return 1;
+        return -1;
     }
 
     return 0;
@@ -135,7 +136,7 @@ int beegfs_plugin_prepare_index_statements(sqlite3 *db,
                                            sqlite3_stmt **targets_stmt,
                                            sqlite3_stmt **rst_stmt) {
     if (!db || !entries_stmt || !targets_stmt || !rst_stmt) {
-        return 1;
+        return -1;
     }
 
     *entries_stmt = NULL;
@@ -152,7 +153,7 @@ int beegfs_plugin_prepare_index_statements(sqlite3 *db,
 
     if (sqlite3_prepare_v2(db, INSERT_ENTRIES, -1, entries_stmt, NULL) != SQLITE_OK) {
         fprintf(stderr, "beegfs plugin: failed to prepare entries statement: %s\n", sqlite3_errmsg(db));
-        return 1;
+        return -1;
     }
 
     static const char INSERT_TARGETS[] =
@@ -163,7 +164,7 @@ int beegfs_plugin_prepare_index_statements(sqlite3 *db,
         fprintf(stderr, "beegfs plugin: failed to prepare targets statement: %s\n", sqlite3_errmsg(db));
         sqlite3_finalize(*entries_stmt);
         *entries_stmt = NULL;
-        return 1;
+        return -1;
     }
 
     static const char INSERT_RST[] =
@@ -175,7 +176,7 @@ int beegfs_plugin_prepare_index_statements(sqlite3 *db,
         *targets_stmt = NULL;
         sqlite3_finalize(*entries_stmt);
         *entries_stmt = NULL;
-        return 1;
+        return -1;
     }
 
     return 0;
@@ -193,7 +194,7 @@ int beegfs_plugin_insert_metadata(sqlite3_stmt *entries_stmt,
                                   const struct beegfs_entry_metadata *metadata,
                                   int64_t *entry_rowid) {
     if (!entries_stmt || !metadata || !entry_rowid) {
-        return 1;
+        return -1;
     }
 
     sqlite3_reset(entries_stmt);
@@ -244,13 +245,13 @@ int beegfs_plugin_insert_metadata(sqlite3_stmt *entries_stmt,
     if (rc != SQLITE_OK) {
         fprintf(stderr, "beegfs plugin: failed to bind entry metadata: %s\n",
                 sqlite3_errmsg(sqlite3_db_handle(entries_stmt)));
-        return 1;
+        return -1;
     }
 
     if (sqlite3_step(entries_stmt) != SQLITE_DONE) {
         fprintf(stderr, "beegfs plugin: failed to insert entry metadata: %s\n",
                 sqlite3_errmsg(sqlite3_db_handle(entries_stmt)));
-        return 1;
+        return -1;
     }
 
     *entry_rowid = sqlite3_last_insert_rowid(sqlite3_db_handle(entries_stmt));
@@ -261,7 +262,7 @@ int beegfs_plugin_insert_targets(const struct beegfs_entry_metadata *metadata,
                                  sqlite3_stmt *targets_stmt,
                                  int64_t entry_rowid) {
     if (!metadata || !targets_stmt) {
-        return 1;
+        return -1;
     }
 
     for (uint16_t i = 0; i < metadata->num_targets; i++) {
@@ -275,13 +276,13 @@ int beegfs_plugin_insert_targets(const struct beegfs_entry_metadata *metadata,
         if (rc != SQLITE_OK) {
             fprintf(stderr, "beegfs plugin: failed to bind stripe target metadata: %s\n",
                     sqlite3_errmsg(sqlite3_db_handle(targets_stmt)));
-            return 1;
+            return -1;
         }
 
         if (sqlite3_step(targets_stmt) != SQLITE_DONE) {
             fprintf(stderr, "beegfs plugin: failed to insert stripe target metadata: %s\n",
                     sqlite3_errmsg(sqlite3_db_handle(targets_stmt)));
-            return 1;
+            return -1;
         }
     }
 
@@ -292,7 +293,7 @@ int beegfs_plugin_insert_rst_ids(const struct beegfs_entry_metadata *metadata,
                                  sqlite3_stmt *rst_stmt,
                                  int64_t entry_rowid) {
     if (!metadata || !rst_stmt) {
-        return 1;
+        return -1;
     }
 
     for (uint32_t i = 0; i < metadata->num_rst_ids; i++) {
@@ -306,13 +307,13 @@ int beegfs_plugin_insert_rst_ids(const struct beegfs_entry_metadata *metadata,
         if (rc != SQLITE_OK) {
             fprintf(stderr, "beegfs plugin: failed to bind RST id: %s\n",
                     sqlite3_errmsg(sqlite3_db_handle(rst_stmt)));
-            return 1;
+            return -1;
         }
 
         if (sqlite3_step(rst_stmt) != SQLITE_DONE) {
             fprintf(stderr, "beegfs plugin: failed to insert RST id: %s\n",
                     sqlite3_errmsg(sqlite3_db_handle(rst_stmt)));
-            return 1;
+            return -1;
         }
     }
 
@@ -321,7 +322,7 @@ int beegfs_plugin_insert_rst_ids(const struct beegfs_entry_metadata *metadata,
 
 int beegfs_create_query_views(sqlite3 *db) {
     if (!db) {
-        return 1;
+        return -1;
     }
 
     /* Real query traversal attaches each directory db as "tree"; the index
@@ -348,7 +349,7 @@ int beegfs_create_query_views(sqlite3 *db) {
     if (sqlite3_exec(db, STUB_SQL, NULL, NULL, &err) != SQLITE_OK) {
         fprintf(stderr, "beegfs plugin: failed to create query stubs: %s\n", err ? err : sqlite3_errmsg(db));
         sqlite3_free(err);
-        return 1;
+        return -1;
     }
 
     return 0;

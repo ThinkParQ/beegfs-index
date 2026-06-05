@@ -37,10 +37,11 @@ static struct beegfs_index_ctx *beegfs_index_ctx_create(sqlite3 *db) {
     return ctx;
 }
 
-static void beegfs_index_ctx_destroy(struct beegfs_index_ctx *ctx) {
-    if (!ctx) {
+static void beegfs_index_ctx_destroy(struct beegfs_index_ctx **ctxp) {
+    if (!ctxp || !*ctxp) {
         return;
     }
+    struct beegfs_index_ctx *ctx = *ctxp;
 
     if (ctx->dir_fd >= 0) {
         close(ctx->dir_fd);
@@ -49,6 +50,7 @@ static void beegfs_index_ctx_destroy(struct beegfs_index_ctx *ctx) {
     beegfs_plugin_finalize_index_statements(ctx->entries_stmt, ctx->targets_stmt,
                                             ctx->rst_stmt);
     free(ctx);
+    *ctxp = NULL;
 }
 
 static int global_init(void *global) {
@@ -68,12 +70,33 @@ static void *ctx_init(void *ptr) {
         if (ctx->dir_fd < 0) {
             fprintf(stderr, "beegfs plugin: cannot open directory %s: %s\n",
                     pcs->work->name, strerror(errno));
-            beegfs_index_ctx_destroy(ctx);
-            ctx = NULL;
+            beegfs_index_ctx_destroy(&ctx);
         }
     }
 
     return ctx;
+}
+
+static int beegfs_index_entry(struct beegfs_index_ctx *ctx,
+                              const struct beegfs_entry_metadata *metadata) {
+    int64_t entry_rowid = 0;
+    int rc = beegfs_plugin_insert_metadata(ctx->entries_stmt, metadata, &entry_rowid);
+    if (rc != 0) {
+        return rc;
+    }
+
+    if (metadata->num_targets > 0) {
+        rc = beegfs_plugin_insert_targets(metadata, ctx->targets_stmt, entry_rowid);
+        if (rc != 0) {
+            return rc;
+        }
+    }
+
+    if (metadata->num_rst_ids > 0) {
+        rc = beegfs_plugin_insert_rst_ids(metadata, ctx->rst_stmt, entry_rowid);
+    }
+
+    return rc;
 }
 
 static void process_entry(void *ptr, void *user_data) {
@@ -99,23 +122,20 @@ static void process_entry(void *ptr, void *user_data) {
         return;
     }
 
-    int64_t entry_rowid = 0;
-    int ok = beegfs_plugin_insert_metadata(ctx->entries_stmt, &metadata, &entry_rowid) == 0;
-    if (ok && (metadata.num_targets > 0)) {
-        ok = beegfs_plugin_insert_targets(&metadata, ctx->targets_stmt, entry_rowid) == 0;
-    }
-    if (ok && (metadata.num_rst_ids > 0)) {
-        ok = beegfs_plugin_insert_rst_ids(&metadata, ctx->rst_stmt, entry_rowid) == 0;
-    }
+    int rc = beegfs_index_entry(ctx, &metadata);
 
-    sqlite3_exec(db, ok ? "RELEASE beegfs_entry"
-                        : "ROLLBACK TO beegfs_entry; RELEASE beegfs_entry",
-                 NULL, NULL, NULL);
+    if (sqlite3_exec(db, rc == 0 ? "RELEASE beegfs_entry"
+                                 : "ROLLBACK TO beegfs_entry; RELEASE beegfs_entry",
+                     NULL, NULL, NULL) != SQLITE_OK) {
+        fprintf(stderr, "beegfs plugin: failed to finalize entry savepoint: %s\n",
+                sqlite3_errmsg(db));
+    }
 }
 
 static void ctx_exit(void *ptr, void *user_data) {
     (void) ptr;
-    beegfs_index_ctx_destroy((struct beegfs_index_ctx *) user_data);
+    struct beegfs_index_ctx *ctx = (struct beegfs_index_ctx *) user_data;
+    beegfs_index_ctx_destroy(&ctx);
 }
 
 static void global_exit(void *global) {
