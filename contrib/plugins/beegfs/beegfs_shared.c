@@ -46,14 +46,29 @@ int beegfs_collect_metadata(int dirfd, const PCS_t *pcs, struct beegfs_entry_met
         return -1;
     }
     switch (arg.getEntryInfoResult) {
-        case 0:
-        case 2: case 3: case 4: case 5: case 10: case 16:
-        case 22: case 23: case 26: case 31: case 32:
+        case BEEGFS_OPS_ERR_SUCCESS:
+        case BEEGFS_OPS_ERR_INTERRUPTED:
+        case BEEGFS_OPS_ERR_COMMUNICATION:
+        case BEEGFS_OPS_ERR_COMMTIMEDOUT:
+        case BEEGFS_OPS_ERR_UNKNOWNNODE:
+        case BEEGFS_OPS_ERR_DYNAMICATTRIBSOUTDATED:
+        case BEEGFS_OPS_ERR_WOULDBLOCK:
+        case BEEGFS_OPS_ERR_AGAIN:
+        case BEEGFS_OPS_ERR_STORAGE_SRV_CRASHED:
+        case BEEGFS_OPS_ERR_OUTOFMEM:
+        case BEEGFS_OPS_ERR_METAVERSIONMISMATCH:
+        case BEEGFS_OPS_ERR_INODELOCKED:
             break;
         default:
             fprintf(stderr, "beegfs plugin: %s: getEntryInfo failed (error %d)\n",
                     metadata->name, (int) arg.getEntryInfoResult);
             return -1;
+    }
+
+    if (arg.getEntryInfoResult == BEEGFS_OPS_ERR_SUCCESS && arg.entryID[0] == '\0') {
+        fprintf(stderr, "beegfs plugin: %s: getEntryInfo succeeded but returned an empty entry ID\n",
+                metadata->name);
+        return -1;
     }
 
     if (arg.entryID[0] != '\0') {
@@ -68,7 +83,7 @@ int beegfs_collect_metadata(int dirfd, const PCS_t *pcs, struct beegfs_entry_met
     }
 
 
-    if (!metadata->got_info || arg.getEntryInfoResult != 0) {
+    if (!metadata->got_info || arg.getEntryInfoResult != BEEGFS_OPS_ERR_SUCCESS) {
         return 0;
     }
 
