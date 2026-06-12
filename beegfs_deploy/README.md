@@ -114,7 +114,9 @@ Useful options (append to the `cmake` line):
 # Install prefix
 
 Packages install BeeGFS Index under `/opt/beegfs`
-(`CPACK_PACKAGING_INSTALL_PREFIX`).
+(`CPACK_PACKAGING_INSTALL_PREFIX`). The exception is the reference config
+`beegfs.index.example`, installed to `/etc/beegfs/index/`. Copy it to the
+BeeGFS mount root as `.beegfs.index` and edit it to configure `beegfs index`.
 
 # Setup Instructions
 Detailed guides on how to configure BeeGFS can be found at

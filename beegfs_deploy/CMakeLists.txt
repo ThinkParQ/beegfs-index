@@ -48,6 +48,14 @@ if(CMAKE_C_COMPILER_ID MATCHES "Clang")
 endif()
 
 option(QPTPOOL_SWAP     "Enable QueuePerThreadPool swapping"     ON)
+# SECURITY (load-bearing): keep this OFF. With it OFF, gufi_query is built
+# without the --read-write (-w) flag and opens every index database read-only,
+# so no query it runs — including raw SQL any user can pass via `beegfs index
+# query` — can modify an on-disk index. This is the primary safeguard for SQL
+# that reaches the index; the Go-side query escaping in beegfs-go (sqlQuote /
+# the Predicate constructors) is defense-in-depth, not a substitute. Turning
+# this ON removes the safeguard for every gufi_query caller. CI asserts it stays
+# off (.github/workflows/check.yml passes -DALLOW_DB_WRITES=Off).
 option(ALLOW_DB_WRITES  "Allow gufi_query to write to databases" OFF)
 option(DEP_USE_JEMALLOC "Link with jemalloc"                     ON)
 option(CROSS_COMPILE    "Cross-compiling for a foreign arch"     OFF)
@@ -197,6 +205,8 @@ target_compile_definitions(gufi_query_lib PUBLIC SQLITE_CORE)
 add_executable(gufi_query "${GUFI_SRC}/gufi_query/main.c" $<TARGET_OBJECTS:gufi_query_lib>)
 target_link_libraries(gufi_query ${COMMON_LIBRARIES})
 add_dependencies(gufi_query GUFI)
+# SECURITY: see the ALLOW_DB_WRITES option above — defining this compiles the
+# --read-write flag into gufi_query and lets it open indexes for writing.
 if(ALLOW_DB_WRITES)
   target_compile_definitions(gufi_query PUBLIC ALLOW_DB_WRITES=1)
 endif()
@@ -219,6 +229,9 @@ install(DIRECTORY "${DEP_INSTALL_PREFIX}/sqlite3/lib/"
   FILES_MATCHING PATTERN "libsqlite3.so.*"
   PATTERN "pkgconfig" EXCLUDE
 )
+
+install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/config/beegfs.index.example"
+  DESTINATION /etc/beegfs/index)
 
 if("${PACKAGE_TYPE}" STREQUAL "deb")
   find_program(DPKG dpkg REQUIRED)
@@ -262,6 +275,7 @@ elseif("${PACKAGE_TYPE}" STREQUAL "rpm")
   set(CPACK_RPM_PACKAGE_REQUIRES     "pcre2, libattr")
   set(CPACK_RPM_PACKAGE_AUTOREQ      OFF)
   set(CPACK_RPM_PACKAGE_RELOCATABLE  ON)
+  set(CPACK_RPM_RELOCATION_PATHS     /opt/beegfs /etc/beegfs)
   set(CPACK_RPM_FILE_NAME            "beegfs-index-${FILE_NAME_VERSION}.${ARCH}.rpm")
   if(CROSS_COMPILE)
     # When cross-compiling, the host strip binary can't parse the target arch's ELF files.

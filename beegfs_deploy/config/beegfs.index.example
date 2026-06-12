@@ -1,0 +1,17 @@
+# .beegfs.index — place at the BeeGFS mount root (e.g. /mnt/beegfs/.beegfs.index)
+#
+# Each [[index]] entry maps a subtree to its GUFI index location.
+# "path" is an absolute filesystem path: the BeeGFS mount point itself, or a
+# directory beneath it. The entry with the longest matching "path" prefix wins.
+
+# Index the entire filesystem locally
+[[index]]
+path = "/mnt/beegfs"
+root = "/mnt/index"
+addr = "local"
+
+# # Example: index a subtree on a remote server
+# [[index]]
+# path = "/mnt/beegfs/project-b"
+# root = "/mnt/remote-index"
+# addr = "ssh:indexserver.cluster.local"
