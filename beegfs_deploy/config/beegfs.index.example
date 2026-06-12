@@ -9,9 +9,11 @@
 path = "/mnt/beegfs"
 root = "/mnt/index"
 addr = "local"
+threads = 8
 
 # # Example: index a subtree on a remote server
 # [[index]]
 # path = "/mnt/beegfs/project-b"
 # root = "/mnt/remote-index"
 # addr = "ssh:indexserver.cluster.local"
+# threads = 8
