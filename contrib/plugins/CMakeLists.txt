@@ -60,6 +60,8 @@
 
 
 
+add_subdirectory(beegfs)
+
 # See if lustre-devel is installed by checking if the lustreapi.h header is in a standard include path.
 find_path(LUSTRE_PLUGIN "lustre/lustreapi.h")
 # If so, build the lustre example plugin:

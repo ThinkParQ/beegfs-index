@@ -4,5 +4,6 @@
 *.pyc
 db.db
 build
+beegfs_deploy/builds
 .DS_Store
 __pycache__/

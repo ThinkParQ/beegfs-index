@@ -1,0 +1,19 @@
+# .beegfs.index — place at the BeeGFS mount root (e.g. /mnt/beegfs/.beegfs.index)
+#
+# The [index] entry maps the BeeGFS filesystem to its GUFI index location.
+# "path" is the absolute filesystem path being indexed (the BeeGFS mount point),
+# "root" is where the index tree lives, and "addr" is "local" or "ssh:<host>".
+
+# Index the filesystem locally
+[index]
+path = "/mnt/beegfs"
+root = "/mnt/index"
+addr = "local"
+threads = 8
+
+# # To delegate indexing to a remote server, set addr to ssh:<host>:
+# [index]
+# path = "/mnt/beegfs"
+# root = "/mnt/index"
+# addr = "ssh:indexserver.cluster.local"
+# threads = 8
