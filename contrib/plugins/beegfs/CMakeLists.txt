@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (c) 2026 ThinkParQ GmbH
+
 set(BEEGFS_PLUGIN_COMMON
   beegfs_shared.c
 )
