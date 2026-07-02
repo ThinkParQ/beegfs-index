@@ -1,3 +1,7 @@
+/* SPDX-License-Identifier: BSD-3-Clause
+ * Copyright (c) 2026 ThinkParQ GmbH
+ */
+
 #ifndef __BH_BEEGFS_IOCTL_H__
 #define __BH_BEEGFS_IOCTL_H__
 
