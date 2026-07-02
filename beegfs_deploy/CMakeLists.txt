@@ -230,6 +230,14 @@ install(DIRECTORY "${DEP_INSTALL_PREFIX}/sqlite3/lib/"
   PATTERN "pkgconfig" EXCLUDE
 )
 
+install(FILES "${GUFI_ROOT}/beegfs_deploy/LICENSE.md"
+  DESTINATION /usr/share/doc/beegfs-index
+)
+
+install(FILES "${GUFI_ROOT}/NOTICE.md"
+  DESTINATION /usr/share/doc/beegfs-index
+)
+
 install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/config/beegfs.index.example"
   DESTINATION /etc/beegfs/index)
 
@@ -247,7 +255,7 @@ if("${PACKAGE_TYPE}" STREQUAL "deb")
   set(CPACK_DEBIAN_PACKAGE_EPOCH        "${BEEGFS_INDEX_EPOCH}")
   set(CPACK_DEBIAN_PACKAGE_MAINTAINER   "ThinkParQ")
   set(CPACK_DEBIAN_PACKAGE_ARCHITECTURE "${ARCH}")
-  set(CPACK_DEBIAN_PACKAGE_DEPENDS      "libpcre2-8-0, libattr1")
+  set(CPACK_DEBIAN_PACKAGE_DEPENDS      "libpcre2-8-0, libattr1, zlib1g")
   set(CPACK_PACKAGE_FILE_NAME           "beegfs-index_${FILE_NAME_VERSION}_${ARCH}")
   if(CMAKE_BUILD_TYPE STREQUAL "Debug")
     set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -g")
@@ -272,10 +280,13 @@ elseif("${PACKAGE_TYPE}" STREQUAL "rpm")
   set(CPACK_RPM_PACKAGE_ARCHITECTURE "${ARCH}")
   set(CPACK_RPM_PACKAGE_LICENSE      "BSD")
   set(CPACK_RPM_PACKAGE_VENDOR       "ThinkParQ")
-  set(CPACK_RPM_PACKAGE_REQUIRES     "pcre2, libattr")
+  set(CPACK_RPM_PACKAGE_REQUIRES     "pcre2, libattr, zlib")
   set(CPACK_RPM_PACKAGE_AUTOREQ      OFF)
   set(CPACK_PACKAGE_RELOCATABLE      OFF)
   set(CPACK_RPM_FILE_NAME            "beegfs-index-${FILE_NAME_VERSION}.${ARCH}.rpm")
+  set(CPACK_RPM_USER_FILELIST
+    "%license /usr/share/doc/beegfs-index/LICENSE.md"
+    "%license /usr/share/doc/beegfs-index/NOTICE.md")
   if(CROSS_COMPILE)
     # When cross-compiling, the host strip binary can't parse the target arch's ELF files.
     # Suppress rpmbuild's brp-strip post-install script to avoid a fatal packaging error.
