@@ -91,8 +91,12 @@ static int update_work(void *args, int count, char **data, char **columns) {
     (void) count; (void) columns;
 
     struct work *work = (struct work *) args;
-    return !((sscanf(data[0], "%" STAT_ino, &work->statuso.st_ino) == 1) &&
-             (sscanf(data[1], "%lld",       &work->pinode)         == 1));
+
+    ino_t pinode = 0;
+    const int ok = (sscanf(data[0], "%" STAT_ino, &work->statuso.st_ino) == 1) &&
+                   (sscanf(data[1], "%" STAT_ino, &pinode)               == 1);
+    work->pinode = pinode;
+    return !ok;
 }
 
 /* place directory data into per-thread database (merged later) */
