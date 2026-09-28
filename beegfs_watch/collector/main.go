@@ -37,14 +37,17 @@ import (
 	"time"
 
 	"github.com/thinkparq/beegfs-go/watch/pkg/subscriber"
-	"github.com/thinkparq/beegfs-index/examples/watch-subscriber/spool"
 	bw "github.com/thinkparq/protobuf/go/beewatch"
 	"go.uber.org/zap"
 	"google.golang.org/protobuf/encoding/protodelim"
 )
 
-// partialSuffix marks a file that is still being written.
-const partialSuffix = spool.PartialSuffix
+// A sealed spool file ends in spoolExt; one still being written adds
+// partialSuffix. Readers match these names, so they must not change.
+const (
+	spoolExt      = ".binpb"
+	partialSuffix = ".partial"
+)
 
 // file is one spool file and the acks owed for what is in it.
 type file struct {
@@ -92,7 +95,7 @@ func (c *collector) add(ev *bw.Event) error {
 		// Microseconds, so two files never share a name within a run. The
 		// sealer's link refuses to replace a file, which covers the rest (a
 		// clock stepped back across a restart, say).
-		name := time.Now().UTC().Format("20060102T150405.000000Z") + spool.Ext
+		name := time.Now().UTC().Format("20060102T150405.000000Z") + spoolExt
 		f, err := os.OpenFile(filepath.Join(c.dir, name+partialSuffix), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
 		if err != nil {
 			return err
@@ -209,7 +212,7 @@ func (c *collector) run(ctx context.Context, every time.Duration) error {
 
 func main() {
 	listen := flag.String("listen", "0.0.0.0:50052", "address Watch dials into")
-	dir := flag.String("spool", "/var/lib/index-sync/spool", "spool directory for "+spool.Ext+" files")
+	dir := flag.String("spool", "/var/lib/index-sync/spool", "spool directory for "+spoolExt+" files")
 	ckpt := flag.String("checkpoint", "/var/lib/index-sync/checkpoint.json", "acked sequence IDs")
 	ackEvery := flag.Duration("checkpoint-every", time.Second, "how often acks reach Watch and disk; Watch frees buffer space only then")
 	rollEvery := flag.Duration("roll-every", 30*time.Second, "seal the open file at least this often")
