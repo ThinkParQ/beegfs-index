@@ -127,21 +127,25 @@ under a second, so acks stay frequent automatically and the system self-regulate
 busy, lazy when idle. A large time bound (e.g. the initially-proposed 10 s) would risk Watch drops
 at peak — see the timing constraint in §7.
 
-### D5 — Length-prefixed binary framing with a `meta`/`seq` header
+### D5 — Length-prefixed protobuf records (`protodelim`), nothing else
 ```
-record: [uvarint payloadLen][uint32 metaId][uint64 seqId][payload bytes]
+record: [uvarint len][bw.Event, protobuf binary]      written with protodelim.MarshalTo
 ```
 *Why:*
 - Payloads are binary protobuf and may contain `\n`; newline-delimited framing is unusable.
-- Putting `metaId`/`seqId` in a fixed header lets the collector ack and detect drops, and lets the
-  downstream utility route/regroup by meta, **without unmarshaling the payload**.
-- `payload` is the protobuf wire form of the event, so downstream decodes with a single
-  `proto.Unmarshal`.
+- `protodelim` is the protobuf library's own length-delimited stream format, so no framing code of
+  ours has to be trusted, and every protobuf implementation can read it.
+- `metaId`/`seqId` are fields of `bw.Event` itself, so they need no extra header. The collector acks
+  from the `*bw.Event` it already holds; a reader gets them from the same decode it needs anyway.
+- *Rejected:* a fixed binary `metaId`/`seqId` header in front of the payload, to read them "without
+  unmarshaling". It is a second, hand-written format to keep in sync, for a decode that is cheap.
 
 ### D6 — Segments form one ordered stream; ack after seal
-Sealed files are numbered monotonically (`seg-0000001`, `seg-0000002`, …). Concatenating them in
-number order reproduces exact subscriber arrival order. The durability boundary is the sealed
-segment; acks are sent immediately after the atomic rename.
+Sealed files are numbered monotonically (`seg-0000000001.binpb`, `seg-0000000002.binpb`, …: ten
+digits, zero-padded). A restart continues after the highest sealed number. Concatenating them in
+number order reproduces exact subscriber arrival order, so a reader keeps its place as one number.
+The durability boundary is the sealed segment; acks are sent right after the seal (fsync, link to
+the final name, directory fsync).
 
 *Why:* a single infinite file complicates crash-safety and hand-off to the consumer. Immutable,
 numbered segments are each complete and safe to consume the instant they appear, and their number
@@ -168,6 +172,12 @@ turns the ack path from O(events) into O(metas × segments) and lets the collect
 `map[metaId]maxSeq` per buffer instead of a full per-event list. Until this lands, the writer replays
 the segment's per-event `(meta, seq)` list (bounded to one segment's worth).
 
+*Cost until then:* 16 B per event in the collector's list and 16 B in the SDK's `pending`, for up to
+`seal-queue + 2` files in flight (the open one, the queue, the one being sealed). With the default
+`-roll-events 100000` and `-seal-queue 4` that is 600k events, ~19 MB. It was 1M per file (~190 MB
+worst case) until a review; the smaller default also keeps the unacked events well inside Watch's
+`event-buffer-size` per meta, which is what makes a collector crash cost only a replay.
+
 ---
 
 ## 5. Architecture
@@ -179,18 +189,18 @@ Watch (N streams, 1 event/msg)
   SDK ReceiveEvents ──► events chan (*bw.Event, buffered 64k–256k)
         │
         ▼
-  RECEIVER goroutine                          WRITER goroutine (single)
-  ┌───────────────────────────┐   handoff    ┌──────────────────────────────┐
-  │ serialize event → bytes    │   chan       │ write whole buffer (1–few     │
-  │ append [len][meta][seq][p] │ (cap 2–4) ──►│   write() syscalls)          │
-  │ update ack info            │              │ fsync                         │
-  │ track lastSeq per meta     │              │ rename .partial → seg-N       │
-  │ rotate on size OR time     │              │ ack Watch (per-event or       │
-  │ swap buffer from sync.Pool │◄─────────────│   AckUpTo per meta)           │
-  └───────────────────────────┘  return buf  └──────────────────────────────┘
-        │                                              │
-        ▼                                              ▼
-   detect seqId gaps (Watch drops)             segment files = final product
+  RECEIVER goroutine (add, rotate)            SEALER goroutine (single)
+  ┌────────────────────────────┐   sealq     ┌──────────────────────────────┐
+  │ protodelim.MarshalTo into   │   FIFO      │ fsync the file               │
+  │   a bufio.Writer on         │ (cap 4) ───►│ link → seg-N.binpb           │
+  │   seg-N.binpb.partial       │             │ remove the .partial          │
+  │ keep (meta, seq) for acks   │             │ fsync the directory          │
+  │ rotate on event count OR    │             │ ack Watch, per event         │
+  │   time: flush, hand over    │             │ (disk error → stop)          │
+  └────────────────────────────┘             └──────────────────────────────┘
+                                                        │
+                                                        ▼
+                                          segment files = final product
 ```
 
 Two goroutines. Disk (the numbered segment sequence) is the single ordered, durable output. There is
@@ -202,27 +212,20 @@ no third "parser" stage (D1).
 
 ```
 <spool>/
-  seg-0000001.partial   # being written, deleted on startup if left behind
-  seg-0000001           # sealed: fsync'd, complete, immutable, safe to consume
-  seg-0000002
-  ...
-<checkpoint path>       # SDK DiskStore: acked seqId per meta (atomic temp+rename)
+  seg-0000000001.binpb           # sealed: fsync'd, complete, immutable, safe to consume
+  seg-0000000002.binpb
+  seg-0000000003.binpb.partial   # being written; deleted on startup if left behind
+<checkpoint path>                # SDK DiskStore: acked seqId per meta (atomic temp+rename)
 ```
 
-Segment file = a sequence of records, each:
+Segment file = a sequence of records, each `[uvarint len][bw.Event]` (`protodelim`). `bw.Event`
+carries `meta_id`, `seq_id` and the V1 or V2 event exactly as Watch sent it.
 
-| field       | type        | notes                                        |
-|-------------|-------------|----------------------------------------------|
-| payloadLen  | uvarint     | length of `payload` in bytes                 |
-| metaId      | uint32 (LE) | source metadata server                       |
-| seqId       | uint64 (LE) | per-meta sequence id                         |
-| payload     | bytes       | protobuf wire form of the `bw.Event`         |
-
-- Segment number is zero-padded and strictly increasing; **consume in number order** to get arrival
-  order.
+- The segment number is strictly increasing; **consume in number order** to get arrival order.
+  Parse the number rather than sorting names, so the order holds past ten digits.
 - Records within a segment are in arrival order.
-- A reference reader/decoder should ship with the collector so the format is executable
-  documentation for the downstream utility team.
+- The reference reader is the `spool` package (`spool.NewReader(f).Next()`); `spoolcat` prints
+  segments as JSON lines. Downstream readers should use it rather than parse bytes themselves.
 
 ---
 
@@ -268,8 +271,12 @@ are received again), but it means **duplicates are possible**. The idempotency/d
 
 ## 9. Crash recovery and idempotency
 
-- Write protocol: create `seg-N.partial` → append records → `fsync` → `rename` to `seg-N` → ack.
-- Startup: delete any `*.partial` (incomplete, their events were never acked and will be replayed).
+- Write protocol: create `seg-N.binpb.partial` (`O_EXCL`) → append records → `fsync` → `link` to
+  `seg-N.binpb` → remove the partial → `fsync` the directory → ack. A link, not a rename: rename
+  would silently replace an existing sealed file, whose events are already acked.
+- Startup: delete any `*.partial` (incomplete, their events were never acked and will be replayed),
+  and continue numbering after the highest sealed segment. A partial's number is reused.
+- A disk error stops the collector: nothing unsealed is acked, and the replay fills the hole.
 - The SDK checkpoint (`DiskStore`) persists the per-meta acked watermark atomically (temp file +
   `fsync` + `rename`); on restart Watch resumes after it, minimizing replay.
 - Duplicates after replay are expected; downstream dedups on `(metaId, seqId)`.
