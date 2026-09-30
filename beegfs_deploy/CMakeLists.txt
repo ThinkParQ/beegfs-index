@@ -16,7 +16,18 @@ if(BEEGFS_INDEX_VERSION STREQUAL "")
     OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
   string(REGEX REPLACE "^v" "" BEEGFS_INDEX_VERSION_FROM_GIT "${BEEGFS_INDEX_VERSION_FROM_GIT}")
   if(BEEGFS_INDEX_VERSION_FROM_GIT STREQUAL "")
-    message(FATAL_ERROR "Cannot determine BEEGFS_INDEX_VERSION. Specify with `cmake -DBEEGFS_INDEX_VERSION=...`")
+    # No release tag is reachable, e.g. on a branch rebased onto upstream GUFI,
+    # where the tags still point at the old commits. Fall back to a dev version
+    # that sorts below every release.
+    execute_process(COMMAND git rev-parse --short=10 HEAD
+      WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+      OUTPUT_VARIABLE BEEGFS_INDEX_GIT_HASH
+      OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+    if(BEEGFS_INDEX_GIT_HASH STREQUAL "")
+      message(FATAL_ERROR "Cannot determine BEEGFS_INDEX_VERSION. Specify with `cmake -DBEEGFS_INDEX_VERSION=...`")
+    endif()
+    set(BEEGFS_INDEX_VERSION_FROM_GIT "0.0.0-g${BEEGFS_INDEX_GIT_HASH}")
+    message(WARNING "No release tag reachable from HEAD; using dev version ${BEEGFS_INDEX_VERSION_FROM_GIT}")
   endif()
   set(BEEGFS_INDEX_VERSION ${BEEGFS_INDEX_VERSION_FROM_GIT} CACHE STRING "Defaults to current git version" FORCE)
   set(BEEGFS_INDEX_EPOCH 19)
@@ -137,6 +148,7 @@ include_directories(
 # -I paths (e.g. CFLAGS wrapper headers) take precedence in the search order.
 include_directories(SYSTEM
   "${XATTR_INCLUDEDIR}"
+  "${PCRE2_INCLUDEDIR}" # external_copy.h includes pcre2.h
 )
 
 set(COMMON_LIBRARIES
@@ -161,9 +173,11 @@ set(GUFI_SOURCES
   "${GUFI_SRC}/debug.c"           "${GUFI_SRC}/descend.c"
   "${GUFI_SRC}/external_attach.c" "${GUFI_SRC}/external_copy.c"
   "${GUFI_SRC}/gufi_vt.c"
-  "${GUFI_SRC}/histogram.c"       "${GUFI_SRC}/outfiles.c"
+  "${GUFI_SRC}/histogram.c"       "${GUFI_SRC}/index.c"
+  "${GUFI_SRC}/outfiles.c"
   "${GUFI_SRC}/path_list.c"       "${GUFI_SRC}/plugin.c"
   "${GUFI_SRC}/popen_argv.c"      "${GUFI_SRC}/print.c"
+  "${GUFI_SRC}/rollup.c"
   "${GUFI_SRC}/run_vt.c"          "${GUFI_SRC}/str.c"
   "${GUFI_SRC}/template_db.c"     "${GUFI_SRC}/trace.c"
   "${GUFI_SRC}/trie.c"            "${GUFI_SRC}/utils.c"
