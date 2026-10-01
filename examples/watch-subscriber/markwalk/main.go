@@ -29,6 +29,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 	"time"
@@ -415,14 +416,22 @@ func main() {
 	opens := flag.Bool("track-opens", false, "include open events, for atime")
 	once := flag.Bool("once", false, "process the segments there now and exit")
 	demo := flag.Bool("demo", false, "run the walk against a temp tree and exit")
+	update := flag.String("update", "",
+		"gufi_incremental_update binary; run after every suspect file, and only its exit 0 finishes a batch (default: suspect files only)")
+	plugin := flag.String("plugin", "", "the update's --plugin, e.g. beegfs_index_ops:/opt/beegfs/lib/libbeegfs_indexing.so")
+	tree := flag.String("tree", "", "the directory the index covers, the update's source tree (default: -mount)")
+	threads := flag.Int("threads", min(runtime.NumCPU(), 16), "the update's -n")
+	updateTimeout := flag.Duration("update-timeout", time.Hour,
+		"longest one update may run before it is killed and the batch tried again; it walks the whole tree, so size it to that")
+	keepFailed := flag.Int("keep-failed", 5, "failed batch directories kept for diagnosis")
 	flag.Parse()
 
 	if *demo {
 		runDemo()
 		return
 	}
-	if *maxSegs < 1 || *cacheSize < 1 || *every <= 0 || *poll <= 0 {
-		slog.Error("max-segments and stat-cache must be at least 1, every and poll above 0")
+	if *maxSegs < 1 || *cacheSize < 1 || *every <= 0 || *poll <= 0 || *threads < 1 || *updateTimeout <= 0 {
+		slog.Error("max-segments, stat-cache and threads must be at least 1; every, poll and update-timeout above 0")
 		os.Exit(2)
 	}
 
@@ -432,6 +441,16 @@ func main() {
 		log: slog.Default(), spool: *spoolDir, statePath: *statePath, work: *work,
 		mount: filepath.Clean(*mount), index: filepath.Clean(*index), query: *query,
 		trackOpens: *opens, maxSegments: *maxSegs, statCacheSize: *cacheSize,
+	}
+	if *update != "" {
+		u, err := newUpdater(*update, *plugin, *tree, r.mount, r.index, *threads, *updateTimeout, *keepFailed)
+		if err != nil {
+			slog.Error("bad -update settings", "error", err)
+			os.Exit(2)
+		}
+		r.update = u
+		slog.Info("incremental update after every batch", "bin", u.bin, "index", u.index, "tree", u.tree,
+			"plugin", u.plugin, "threads", u.threads, "timeout", u.timeout)
 	}
 	if err := r.run(ctx, *every, *poll, *once); err != nil {
 		slog.Error("markwalk stopped", "error", err)
