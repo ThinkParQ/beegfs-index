@@ -24,7 +24,7 @@ import (
 // state is how far markwalk got, kept in one small file.
 type state struct {
 	// Segment is the number of the last segment whose batch is done. The next run starts after
-	// it. Until the incremental update runs here, "done" means its suspect file is on disk.
+	// it. "Done" means its suspect file is on disk and, with -update, the index has it too.
 	Segment uint64 `json:"segment"`
 	// Seqs is each meta's highest sequence ID seen, so a hole across batches and restarts is
 	// still found.
@@ -102,12 +102,15 @@ type reader struct {
 	query         string // gufi_query, for the sibling lookup
 	trackOpens    bool
 	maxSegments   int
-	statCacheSize int // most stat answers a batch keeps, see statCache
+	statCacheSize int      // most stat answers a batch keeps, see statCache
+	update        *updater // nil: write suspect files only
 }
 
 // run processes new segments until ctx is done. With once it processes what is there now and
-// returns. Between batches it waits every, so a batch collects that long; with nothing new it
-// looks again after poll.
+// returns. A batch starts at most every `every`, counted from the start of the one before, so
+// a long incremental update eats into the wait instead of adding to it; with nothing new it
+// looks again after poll. A failed update keeps the state and tries the batch again after
+// every (with once, it stops markwalk).
 func (r *reader) run(ctx context.Context, every, poll time.Duration, once bool) error {
 	st, err := readState(r.statePath)
 	if err != nil {
@@ -124,10 +127,17 @@ func (r *reader) run(ctx context.Context, every, poll time.Duration, once bool) 
 		}
 		wait := poll
 		if len(segs) > 0 {
-			if err := r.process(&st, segs); err != nil {
+			began := time.Now()
+			err := r.process(ctx, &st, segs)
+			switch {
+			case ctx.Err() != nil:
+				return nil // stopping; a batch cut short is made again next start
+			case errors.Is(err, errUpdate) && !once:
+				r.log.Error("batch not done, trying again", "error", err, "in", every)
+			case err != nil:
 				return err
 			}
-			wait = every
+			wait = max(every-time.Since(began), 0)
 		} else if once {
 			return nil
 		}
@@ -145,7 +155,7 @@ func (r *reader) run(ctx context.Context, every, poll time.Duration, once bool) 
 // process makes one batch of segs, writes its suspect file, and only then moves st past it. A
 // crash before the state write repeats the batch; it writes the same file again, which is
 // harmless.
-func (r *reader) process(st *state, segs []spool.Segment) error {
+func (r *reader) process(ctx context.Context, st *state, segs []spool.Segment) error {
 	first, last := segs[0].Number, segs[len(segs)-1].Number
 	seqs := maps.Clone(st.Seqs)
 	dirs := map[string]struct{}{}
@@ -183,10 +193,31 @@ func (r *reader) process(st *state, segs []spool.Segment) error {
 	// One query for the whole batch, not one per event.
 	marked := append(slices.Collect(maps.Keys(dirs)),
 		siblingDirs(slices.Collect(maps.Keys(links)), r.mount, r.index, r.query)...)
-	out := filepath.Join(r.work, fmt.Sprintf("batch-%010d", last), "suspects")
+	dir := filepath.Join(r.work, fmt.Sprintf("batch-%010d", last))
+	out := filepath.Join(dir, "suspects")
 	marks, stats, err := writeSuspects(marked, r.mount, r.index, out, false, r.statCacheSize)
 	if err != nil {
 		return fmt.Errorf("write %s: %w", out, err)
+	}
+
+	var took time.Duration
+	uncovered := 0
+	if r.update != nil && marks > 0 {
+		began := time.Now()
+		if err := r.update.run(ctx, dir, out); err != nil {
+			if errors.Is(err, errUpdate) {
+				if kept, kerr := r.update.keepFailedBatch(r.work, dir); kerr == nil {
+					err = fmt.Errorf("%w (batch kept in %s)", err, kept)
+				}
+			}
+			return fmt.Errorf("segments %d-%d: %w", first, last, err)
+		}
+		took = time.Since(began)
+		if u := r.update.uncovered(marked, r.mount, r.index); len(u) > 0 {
+			uncovered = len(u)
+			r.log.Warn("marked directories still without a db.db after the update",
+				"count", len(u), "first", u[0])
+		}
 	}
 
 	st.Segment, st.Seqs = last, seqs
@@ -197,10 +228,20 @@ func (r *reader) process(st *state, segs []spool.Segment) error {
 	if marks == 0 {
 		out = "none: nothing left to mark"
 	}
-	r.log.Info("batch done", "first_segment", first, "last_segment", last, "segments", len(segs),
+	attrs := []any{"first_segment", first, "last_segment", last, "segments", len(segs),
 		"events", events, "directories", len(dirs), "multi_name_inodes", len(links), "marks", marks,
-		"stats", stats,
-		"v1_events_skipped", v1, "missing_events", missing, "suspects", out)
+		"stats", stats, "v1_events_skipped", v1, "missing_events", missing}
+	if r.update != nil {
+		// The batch is in the index now; its suspect file, log and parking lot are not needed.
+		if err := os.RemoveAll(dir); err != nil {
+			r.log.Warn("could not remove a finished batch", "dir", dir, "error", err)
+		}
+		attrs = append(attrs, "updated", marks > 0, "update_took", took.Round(time.Millisecond),
+			"uncovered", uncovered)
+	} else {
+		attrs = append(attrs, "suspects", out)
+	}
+	r.log.Info("batch done", attrs...)
 	return nil
 }
 
