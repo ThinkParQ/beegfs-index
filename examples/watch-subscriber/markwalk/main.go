@@ -1,7 +1,8 @@
-// From Watch events to a GUFI suspect file.
+// From the collector's segment files to a GUFI suspect file.
 //
-// The subscriber in the parent directory prints events. This one does the next job: it turns
-// them into the input GUFI's incremental update actually wants.
+// The collector receives Watch's events and seals them into numbered segment files. markwalk
+// reads the new ones in number order and turns each batch into the input GUFI's incremental
+// update wants: one "<inode> d" line per directory to rescan.
 //
 // There are three steps between an event and that file, and each one can lose data quietly:
 //
@@ -9,30 +10,31 @@
 //  2. a directory                  -> is it still there, and does the index know its parents?
 //  3. a set of directories         -> "<inode> d" lines
 //
-// Watch dials OUT to this process, so we are the gRPC server. Run it, make some noise on the
-// mount, and watch the suspect file fill up:
+// Each batch goes to <work>/batch-<last segment>/suspects, and only then does the state file
+// move past it, so a crash repeats a batch and never skips one. Running the incremental update
+// on that file, and deleting segments once it succeeded, come next (DESIGN.md §4, §6).
 //
-//	go run ./markwalk -mount /mnt/beegfs -index /var/lib/gufi -out /tmp/suspects
+//	go run ./markwalk -spool /local/bt/collector/spool -mount /mnt/beegfs -index /var/lib/gufi
 //
-// Pass -demo to skip the network and see the walk handle five awkward situations instead.
+// Pass -once to process what is there and exit, or -demo to see the walk handle five awkward
+// situations on a temp tree.
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
-	"io"
-	"log"
-	"net"
+	"io/fs"
+	"log/slog"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 
 	bw "github.com/thinkparq/protobuf/go/beewatch"
-	"google.golang.org/grpc"
 )
 
 // ---------------------------------------------------------------------------
@@ -42,8 +44,13 @@ import (
 // just the parent, because only the listing changed. The exceptions are where the bugs live.
 // ---------------------------------------------------------------------------
 
-// dirsFor returns the directories this event dirties, and — when the inode has more than one
-// name — its entry ID, so the other names can be looked up later. See siblingDirs.
+// dirsFor returns the paths this event dirties, and — when the inode has more than one name —
+// its entry ID, so the other names can be looked up later. See siblingDirs.
+//
+// A listing change names the parent. An inode change names the path itself: markChain marks it
+// if it is a directory, whose own mode, owner and times live in its own db.db, and otherwise
+// rises to the parent, where a file's are recorded. An event on the root has path "/", which
+// makes the mount itself, never the directory the mount sits in.
 func dirsFor(ev *bw.V2Event, mount string, trackOpens bool) (dirs []string, entryID string) {
 	// Event paths are mount-relative, so they need the mount put back on the front.
 	abs := func(p string) string { return filepath.Join(mount, p) }
@@ -51,6 +58,9 @@ func dirsFor(ev *bw.V2Event, mount string, trackOpens bool) (dirs []string, entr
 	parent := filepath.Dir(path)
 
 	switch ev.GetType() {
+	case bw.V2Event_INVALID:
+		return nil, "" // carries no path; joining "" would name the mount's parent
+
 	case bw.V2Event_MKDIR:
 		// The new directory needs its own line. Marking only the parent creates it in the
 		// index with no db.db, and its contents never show up.
@@ -60,8 +70,15 @@ func dirsFor(ev *bw.V2Event, mount string, trackOpens bool) (dirs []string, entr
 		// RENAME fires once, on the source, with the destination in target_path. Mark the
 		// common ancestor as well: two parents alone make the diff see a delete plus a
 		// create, which throws the moved databases away instead of moving them.
-		dst := filepath.Dir(abs(ev.GetTargetPath()))
-		return []string{commonAncestor(parent, dst), parent, dst}, ""
+		//
+		// The destination itself too: a directory made since the last index and then moved
+		// was marked by its MKDIR under a path that is gone by now, so the walk marked an
+		// ancestor instead, and the incremental update creates it with no db.db. A file
+		// there rises to dst, which is marked anyway. Directories below a moved one are
+		// newDirsUnder's job.
+		target := abs(ev.GetTargetPath())
+		dst := filepath.Dir(target)
+		return []string{commonAncestor(parent, dst), parent, dst, target}, ""
 
 	case bw.V2Event_HARDLINK:
 		// nlink is stored per name, in whichever directory lists it, so the directory
@@ -76,7 +93,7 @@ func dirsFor(ev *bw.V2Event, mount string, trackOpens bool) (dirs []string, entr
 		if !trackOpens {
 			return nil, ""
 		}
-		return []string{parent}, linkedEntryID(ev)
+		return []string{path}, linkedEntryID(ev)
 
 	case bw.V2Event_OPEN_BLOCKED:
 		return nil, "" // the open was refused, so nothing on the inode changed
@@ -84,17 +101,22 @@ func dirsFor(ev *bw.V2Event, mount string, trackOpens bool) (dirs []string, entr
 	case bw.V2Event_INODE_LOCKED:
 		return nil, "" // its path is a bare filename, not a path
 
+	case bw.V2Event_FLUSH, bw.V2Event_TRUNCATE, bw.V2Event_SETATTR, bw.V2Event_CLOSE_WRITE,
+		bw.V2Event_LAST_WRITER_CLOSED, bw.V2Event_STRIPE_PATTERN_CHANGED:
+		// The inode changed: the path itself if it is a directory, else its parent.
+		return []string{path}, linkedEntryID(ev)
+
 	default:
-		// CREATE MKNOD SYMLINK RMDIR UNLINK: only the listing changed.
-		// FLUSH TRUNCATE SETATTR CLOSE_WRITE LAST_WRITER_CLOSED STRIPE_PATTERN_CHANGED:
-		// the inode changed, and the parent is where its size and mtime are recorded.
-		//
+		// CREATE MKNOD SYMLINK RMDIR UNLINK: only the listing changed. An UNLINK that leaves
+		// other names also changed their link count; linkedEntryID finds them.
+		// A type added after this was written lands here too, which marks the parent: a
+		// rescan too many, never one too few.
 		return []string{parent}, linkedEntryID(ev)
 	}
 }
 
 // linkedEntryID returns the event's entry ID when the inode has more than one name and
-// this event changed the inode rather than a listing.
+// this event changed the inode, or took away one of its names.
 //
 // A write reaches the inode, so every name reports a new size and mtime. The event names only
 // one of them. num_links says the situation exists; only the index knows where the others are.
@@ -102,6 +124,15 @@ func dirsFor(ev *bw.V2Event, mount string, trackOpens bool) (dirs []string, entr
 // The entry ID is used rather than the path because hard links share it, the index records it,
 // and it needs no stat — so a name unlinked before the batch runs still refreshes the rest.
 func linkedEntryID(ev *bw.V2Event) string {
+	// UNLINK reports the names left after it (measured: 3 names, rm -> 2, rm -> 1, the last rm
+	// reports none), so any left means their link count changed. Every other type counts the
+	// event's own name too.
+	if ev.GetType() == bw.V2Event_UNLINK {
+		if ev.GetNumLinks() >= 1 && validEntryID(ev.GetEntryId()) {
+			return ev.GetEntryId()
+		}
+		return ""
+	}
 	if ev.GetNumLinks() <= 1 {
 		return ""
 	}
@@ -161,7 +192,7 @@ func siblingDirs(entryIDs []string, mount, indexRoot, queryBin string) []string 
 
 	out, err := exec.Command(queryBin, "-d", "\n", "-E", sql, indexRoot).Output()
 	if err != nil {
-		log.Printf("sibling lookup failed, other names keep a stale size: %v", err)
+		slog.Warn("sibling lookup failed; other names of multi-name files keep a stale size", "error", err)
 		return nil
 	}
 
@@ -214,6 +245,31 @@ func statDir(path string) (inode uint64, isDir bool) {
 // database in another, so a run that died in between leaves a directory with no database.
 // Counting that as covered strands everything below it: every later event stops walking at
 // the same broken level and never gets past it.
+// newDirsUnder returns the directories below to, a rename's destination, that the index
+// does not have at the same place below from, its source.
+//
+// The incremental update moves an indexed directory's db.db along with it, but a directory
+// it has no db.db for gets one only if the suspect file names it. Below a moved directory
+// nothing names the new ones: their MKDIR paths are under the old name, which is gone. So
+// this walks the moved tree. It reads every directory in it, which costs as much as the
+// tree is big, but a rename of a large indexed tree finds every subdirectory covered and
+// adds no marks. A source path that is not the indexed one (the second of two renames in
+// a batch) covers nothing, which marks too many, never too few.
+func newDirsUnder(to, from, mount, indexRoot string) []string {
+	var dirs []string
+	_ = filepath.WalkDir(to, func(p string, d fs.DirEntry, err error) error {
+		if err != nil || !d.IsDir() || p == to {
+			return nil // gone or unreadable: nothing below it to mark
+		}
+		rel, err := filepath.Rel(to, p)
+		if err == nil && !indexCovers(filepath.Join(from, rel), mount, indexRoot) {
+			dirs = append(dirs, p)
+		}
+		return nil
+	})
+	return dirs
+}
+
 func indexCovers(dir, mount, indexRoot string) bool {
 	rel, err := filepath.Rel(mount, dir)
 	if err != nil {
@@ -298,146 +354,44 @@ func writeSuspects(dirs []string, mount, indexRoot, out string, trace bool) (int
 			fmt.Printf("    %d d        # %s\n", ino, name)
 		}
 	}
-	return len(seen), os.WriteFile(out, []byte(b.String()), 0o644)
-}
-
-// ---------------------------------------------------------------------------
-// Part 4: the subscriber. Watch dials in, we collect, and every interval we flush.
-// ---------------------------------------------------------------------------
-
-type collector struct {
-	bw.UnimplementedSubscriberServer
-
-	mount, indexRoot, out, queryBin string
-	trackOpens                      bool
-
-	mu      sync.Mutex
-	pending map[string]struct{}
-	// links holds the entry IDs of files with more than one name. Their other names sit in
-	// directories no event will ever mention, so they are resolved once per batch.
-	links  map[string]struct{}
-	events int
-}
-
-func (c *collector) add(dirs []string, entryID string) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	for _, d := range dirs {
-		c.pending[d] = struct{}{}
-	}
-	if entryID != "" {
-		c.links[entryID] = struct{}{}
-	}
-	c.events++
-}
-
-// flush turns everything collected so far into the suspect file and empties the set.
-//
-// Note what this does NOT do: it does not wait for GUFI to finish before clearing. A real
-// service must not acknowledge events until the rescan they caused has actually run, or a
-// crash in between loses them silently.
-func (c *collector) flush() {
-	c.mu.Lock()
-	dirs := make([]string, 0, len(c.pending))
-	for d := range c.pending {
-		dirs = append(dirs, d)
-	}
-	links := make([]string, 0, len(c.links))
-	for f := range c.links {
-		links = append(links, f)
-	}
-	n := c.events
-	c.pending = map[string]struct{}{}
-	c.links = map[string]struct{}{}
-	c.events = 0
-	c.mu.Unlock()
-
-	if len(dirs) == 0 && len(links) == 0 {
-		return
-	}
-	fmt.Printf("\n%s  %d events -> %d directories\n", time.Now().Format("15:04:05"), n, len(dirs))
-
-	// One query for the whole batch, not one per event.
-	if extra := siblingDirs(links, c.mount, c.indexRoot, c.queryBin); len(extra) > 0 {
-		fmt.Printf("  %d multi-link inodes also live in: %v\n", len(links), extra)
-		dirs = append(dirs, extra...)
-	}
-	marks, err := writeSuspects(dirs, c.mount, c.indexRoot, c.out, true)
-	if err != nil {
-		log.Printf("write %s: %v", c.out, err)
-		return
-	}
-	fmt.Printf("  wrote %d marks to %s\n", marks, c.out)
-	fmt.Printf("  gufi_incremental_update --suspect-method 1 --suspect-file %s %s %s <parking-lot>\n",
-		c.out, c.indexRoot, c.mount)
-}
-
-// ReceiveEvents is the only RPC. Watch streams Events in, we stream Responses back to
-// acknowledge them. An empty EventFilter on the first Response means "send me everything".
-func (c *collector) ReceiveEvents(stream bw.Subscriber_ReceiveEventsServer) error {
-	log.Println("Watch connected")
-	if err := stream.Send(&bw.Response{CompletedSeq: 0}); err != nil {
-		return err
-	}
-
-	for {
-		ev, err := stream.Recv()
-		if err == io.EOF {
-			log.Println("Watch closed the stream")
-			return nil
-		}
-		if err != nil {
-			return err
-		}
-
-		if v2 := ev.GetV2(); v2 != nil {
-			c.add(dirsFor(v2, c.mount, c.trackOpens))
-		}
-
-		// Acknowledging here is too early, see flush. Fine for a demo.
-		if err := stream.Send(&bw.Response{CompletedSeq: ev.GetSeqId()}); err != nil {
-			return err
-		}
-	}
+	return len(seen), writeFileAtomic(out, []byte(b.String()))
 }
 
 func main() {
-	addr := flag.String("listen", "0.0.0.0:50052", "address Watch should dial")
+	spoolDir := flag.String("spool", "/var/lib/index-sync/spool", "the collector's segment directory")
+	statePath := flag.String("state", "/var/lib/index-sync/markwalk.json", "how far markwalk got")
+	work := flag.String("work", "/var/lib/index-sync/markwalk", "where each batch's suspect file goes")
 	mount := flag.String("mount", "/mnt/beegfs", "the BeeGFS mount, so paths can be made absolute")
 	index := flag.String("index", "/var/lib/gufi", "GUFI index root")
-	out := flag.String("out", "/tmp/suspects", "suspect file to write")
 	query := flag.String("query", "gufi_query", "gufi_query binary, used to find the other names of a multi-link inode")
-	every := flag.Duration("every", 5*time.Second, "how often to flush")
+	every := flag.Duration("every", time.Minute, "how long a batch collects before it is made")
+	poll := flag.Duration("poll", 5*time.Second, "how often to look for new segments when there are none")
+	maxSegs := flag.Int("max-segments", 100, "most segments in one batch")
 	opens := flag.Bool("track-opens", false, "include open events, for atime")
-	demo := flag.Bool("demo", false, "skip the network, run the walk against a temp tree")
+	once := flag.Bool("once", false, "process the segments there now and exit")
+	demo := flag.Bool("demo", false, "run the walk against a temp tree and exit")
 	flag.Parse()
 
 	if *demo {
 		runDemo()
 		return
 	}
-
-	c := &collector{
-		mount: *mount, indexRoot: *index, out: *out, queryBin: *query, trackOpens: *opens,
-		pending: map[string]struct{}{},
-		links:   map[string]struct{}{},
+	if *maxSegs < 1 || *every <= 0 || *poll <= 0 {
+		slog.Error("max-segments must be at least 1, every and poll above 0")
+		os.Exit(2)
 	}
 
-	go func() {
-		for range time.Tick(*every) {
-			c.flush()
-		}
-	}()
-
-	lis, err := net.Listen("tcp", *addr)
-	if err != nil {
-		log.Fatalf("listen %s: %v", *addr, err)
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	r := &reader{
+		log: slog.Default(), spool: *spoolDir, statePath: *statePath, work: *work,
+		mount: filepath.Clean(*mount), index: filepath.Clean(*index), query: *query,
+		trackOpens: *opens, maxSegments: *maxSegs,
 	}
-	g := grpc.NewServer()
-	bw.RegisterSubscriberServer(g, c)
-
-	log.Printf("listening on %s; mount=%s index=%s out=%s", *addr, *mount, *index, *out)
-	log.Fatal(g.Serve(lis))
+	if err := r.run(ctx, *every, *poll, *once); err != nil {
+		slog.Error("markwalk stopped", "error", err)
+		os.Exit(1)
+	}
 }
 
 // ---------------------------------------------------------------------------
