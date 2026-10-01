@@ -93,15 +93,16 @@ func writeFileAtomic(path string, data []byte) error {
 
 // reader turns segments into suspect files.
 type reader struct {
-	log         *slog.Logger
-	spool       string // the collector's segment directory
-	statePath   string
-	work        string // one directory per batch: batch-<last segment>/suspects
-	mount       string
-	index       string
-	query       string // gufi_query, for the sibling lookup
-	trackOpens  bool
-	maxSegments int
+	log           *slog.Logger
+	spool         string // the collector's segment directory
+	statePath     string
+	work          string // one directory per batch: batch-<last segment>/suspects
+	mount         string
+	index         string
+	query         string // gufi_query, for the sibling lookup
+	trackOpens    bool
+	maxSegments   int
+	statCacheSize int // most stat answers a batch keeps, see statCache
 }
 
 // run processes new segments until ctx is done. With once it processes what is there now and
@@ -150,8 +151,6 @@ func (r *reader) process(st *state, segs []spool.Segment) error {
 	dirs := map[string]struct{}{}
 	// Entry IDs of files with more than one name; the index supplies where the others are.
 	links := map[string]struct{}{}
-	// Renames, source to destination: new directories below a moved one need their own marks.
-	moves := map[[2]string]struct{}{}
 	var events, v1, missing uint64
 
 	for _, s := range segs {
@@ -175,10 +174,6 @@ func (r *reader) process(st *state, segs []spool.Segment) error {
 			if id != "" {
 				links[id] = struct{}{}
 			}
-			if v2.GetType() == bw.V2Event_RENAME {
-				moves[[2]string{filepath.Join(r.mount, v2.GetPath()),
-					filepath.Join(r.mount, v2.GetTargetPath())}] = struct{}{}
-			}
 		})
 		if err != nil {
 			return err // a damaged segment stops markwalk rather than skip what it held
@@ -188,11 +183,8 @@ func (r *reader) process(st *state, segs []spool.Segment) error {
 	// One query for the whole batch, not one per event.
 	marked := append(slices.Collect(maps.Keys(dirs)),
 		siblingDirs(slices.Collect(maps.Keys(links)), r.mount, r.index, r.query)...)
-	for m := range moves {
-		marked = append(marked, newDirsUnder(m[1], m[0], r.mount, r.index)...)
-	}
 	out := filepath.Join(r.work, fmt.Sprintf("batch-%010d", last), "suspects")
-	marks, err := writeSuspects(marked, r.mount, r.index, out, false)
+	marks, stats, err := writeSuspects(marked, r.mount, r.index, out, false, r.statCacheSize)
 	if err != nil {
 		return fmt.Errorf("write %s: %w", out, err)
 	}
@@ -207,6 +199,7 @@ func (r *reader) process(st *state, segs []spool.Segment) error {
 	}
 	r.log.Info("batch done", "first_segment", first, "last_segment", last, "segments", len(segs),
 		"events", events, "directories", len(dirs), "multi_name_inodes", len(links), "marks", marks,
+		"stats", stats,
 		"v1_events_skipped", v1, "missing_events", missing, "suspects", out)
 	return nil
 }

@@ -31,8 +31,15 @@ become one entry in the set.
 STEP 2: WHICH DIRECTORIES DOES AN EVENT DIRTY?
 ==============================================
 
-Most events: just the parent directory.
-Only the listing changed, and the listing lives in the parent.
+Listing changes (CREATE, MKNOD, SYMLINK, UNLINK, RMDIR): the parent.
+The listing lives in the parent.
+
+Inode changes (SETATTR, TRUNCATE, FLUSH, CLOSE_WRITE, LAST_WRITER_CLOSED,
+STRIPE_PATTERN_CHANGED, tracked OPEN_*): the path itself. The walk
+(step 3) keeps it if it is a directory, since a directory's own mode,
+owner and times live in its own db.db. Otherwise it rises to the parent,
+where a file's are recorded. The root's path is "/", which means the
+mount, never the mount's parent.
 
 The exceptions:
 
@@ -56,6 +63,8 @@ The exceptions:
   OPEN_*        nothing, unless --track-opens is set.
                 They only move atime, and there are a lot of them.
 
+  INVALID       nothing. It carries no path.
+
 
 STEP 2b: FILES WITH MORE THAN ONE NAME
 ======================================
@@ -63,8 +72,8 @@ STEP 2b: FILES WITH MORE THAN ONE NAME
 A write changes the inode. Every name of that inode now reports a new
 size and time. The event only tells us about one name.
 
-So: if num_links > 1 AND the event touched the inode, set the event's
-entry ID aside. At flush time we ask the index, in one query, where
+So: if the event touched the inode AND another name exists, set the
+event's entry ID aside. At flush time we ask the index, in one query, where
 else that inode is listed, and mark those directories too.
 
 The entry ID comes straight off the event. Hard links share it, and
@@ -76,8 +85,12 @@ event and the batch.
 Checked in that order, so a normal single-link file costs one integer
 comparison and nothing else. No query runs if nothing qualifies.
 
-Note: CREATE and UNLINK on a multi-link file do NOT qualify. They
-change a listing, not the inode, so the other names are unaffected.
+"Another name exists" is num_links > 1 for every event except UNLINK.
+Measured on v8: UNLINK reports the names LEFT (three names: rm -> 2,
+rm -> 1, last rm -> none). So UNLINK qualifies at num_links >= 1: the
+inode's link count dropped, and every remaining name is now stale.
+
+CREATE does not qualify. It makes a new inode with one name.
 
 
 STEP 3: THE WALK
