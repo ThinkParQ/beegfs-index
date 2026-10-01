@@ -24,7 +24,6 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"io/fs"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -71,11 +70,10 @@ func dirsFor(ev *bw.V2Event, mount string, trackOpens bool) (dirs []string, entr
 		// common ancestor as well: two parents alone make the diff see a delete plus a
 		// create, which throws the moved databases away instead of moving them.
 		//
-		// The destination itself too: a directory made since the last index and then moved
-		// was marked by its MKDIR under a path that is gone by now, so the walk marked an
-		// ancestor instead, and the incremental update creates it with no db.db. A file
-		// there rises to dst, which is marked anyway. Directories below a moved one are
-		// newDirsUnder's job.
+		// The destination itself too. GUFI's incremental update rebuilds a moved or new
+		// directory it has no database for on its own, so this is cheap insurance, not a
+		// requirement: a directory made and moved in one batch was marked by its MKDIR
+		// under a path that is gone by now. A file there rises to dst, marked anyway.
 		target := abs(ev.GetTargetPath())
 		dst := filepath.Dir(target)
 		return []string{commonAncestor(parent, dst), parent, dst, target}, ""
@@ -93,7 +91,7 @@ func dirsFor(ev *bw.V2Event, mount string, trackOpens bool) (dirs []string, entr
 		if !trackOpens {
 			return nil, ""
 		}
-		return []string{path}, linkedEntryID(ev)
+		return []string{parent}, linkedEntryID(ev) // only files emit opens; see FLUSH below
 
 	case bw.V2Event_OPEN_BLOCKED:
 		return nil, "" // the open was refused, so nothing on the inode changed
@@ -101,10 +99,17 @@ func dirsFor(ev *bw.V2Event, mount string, trackOpens bool) (dirs []string, entr
 	case bw.V2Event_INODE_LOCKED:
 		return nil, "" // its path is a bare filename, not a path
 
-	case bw.V2Event_FLUSH, bw.V2Event_TRUNCATE, bw.V2Event_SETATTR, bw.V2Event_CLOSE_WRITE,
-		bw.V2Event_LAST_WRITER_CLOSED, bw.V2Event_STRIPE_PATTERN_CHANGED:
-		// The inode changed: the path itself if it is a directory, else its parent.
+	case bw.V2Event_SETATTR, bw.V2Event_STRIPE_PATTERN_CHANGED:
+		// The inode changed, and it can be a directory's (chmod, setpattern on a directory):
+		// the path itself if it is a directory, else its parent.
 		return []string{path}, linkedEntryID(ev)
+
+	case bw.V2Event_FLUSH, bw.V2Event_TRUNCATE, bw.V2Event_CLOSE_WRITE, bw.V2Event_LAST_WRITER_CLOSED:
+		// Only a regular file is written, truncated or closed after writing, so these name
+		// the parent straight away. Naming the file makes every file a separate entry that
+		// markChain must stat before it rises to the same parent: a tree written once and
+		// removed is millions of stats of names that are gone (fslab, 15M events: >15 min).
+		return []string{parent}, linkedEntryID(ev)
 
 	default:
 		// CREATE MKNOD SYMLINK RMDIR UNLINK: only the listing changed. An UNLINK that leaves
@@ -226,6 +231,66 @@ func siblingDirs(entryIDs []string, mount, indexRoot, queryBin string) []string 
 // Both are fixed by walking up. The rest is knowing when to stop.
 // ---------------------------------------------------------------------------
 
+// statCache remembers statDir answers for one batch, so a path many marks share (an
+// ancestor, the inode lookup after markChain) costs one round trip to a metadata server, not
+// one per mark.
+//
+// It holds at most limit answers and drops the least recently used one to make room, so the
+// paths a batch keeps asking about stay and memory stays bounded (about 150 bytes plus the
+// path per answer). Forgetting is always safe: the path is only asked again.
+//
+// A batch is a moment: what changes while it runs is in the next batch's events, so a cache
+// lives for one batch only.
+type statCache struct {
+	limit  int
+	byPath map[string]*statEntry
+	// A ring through a sentinel: head.next is the most recently used, head.prev the least.
+	head  statEntry
+	stats int // statDir calls, the round trips this batch made
+}
+
+type statEntry struct {
+	path       string
+	inode      uint64
+	isDir      bool
+	prev, next *statEntry
+}
+
+func newStatCache(limit int) *statCache {
+	c := &statCache{limit: max(limit, 1), byPath: map[string]*statEntry{}}
+	c.head.prev, c.head.next = &c.head, &c.head
+	return c
+}
+
+func (c *statCache) stat(path string) (inode uint64, isDir bool) {
+	if e, ok := c.byPath[path]; ok {
+		c.unlink(e)
+		c.pushFront(e)
+		return e.inode, e.isDir
+	}
+	e := &statEntry{path: path}
+	e.inode, e.isDir = statDir(path)
+	c.stats++
+	if len(c.byPath) >= c.limit {
+		old := c.head.prev
+		c.unlink(old)
+		delete(c.byPath, old.path)
+	}
+	c.pushFront(e)
+	c.byPath[path] = e
+	return e.inode, e.isDir
+}
+
+func (c *statCache) unlink(e *statEntry) {
+	e.prev.next, e.next.prev = e.next, e.prev
+}
+
+func (c *statCache) pushFront(e *statEntry) {
+	e.prev, e.next = &c.head, c.head.next
+	c.head.next.prev = e
+	c.head.next = e
+}
+
 // statDir answers "is this a directory" and "what is its inode" from a single stat.
 //
 // The type check matters: a directory can be replaced by a file of the same name before you
@@ -245,31 +310,6 @@ func statDir(path string) (inode uint64, isDir bool) {
 // database in another, so a run that died in between leaves a directory with no database.
 // Counting that as covered strands everything below it: every later event stops walking at
 // the same broken level and never gets past it.
-// newDirsUnder returns the directories below to, a rename's destination, that the index
-// does not have at the same place below from, its source.
-//
-// The incremental update moves an indexed directory's db.db along with it, but a directory
-// it has no db.db for gets one only if the suspect file names it. Below a moved directory
-// nothing names the new ones: their MKDIR paths are under the old name, which is gone. So
-// this walks the moved tree. It reads every directory in it, which costs as much as the
-// tree is big, but a rename of a large indexed tree finds every subdirectory covered and
-// adds no marks. A source path that is not the indexed one (the second of two renames in
-// a batch) covers nothing, which marks too many, never too few.
-func newDirsUnder(to, from, mount, indexRoot string) []string {
-	var dirs []string
-	_ = filepath.WalkDir(to, func(p string, d fs.DirEntry, err error) error {
-		if err != nil || !d.IsDir() || p == to {
-			return nil // gone or unreadable: nothing below it to mark
-		}
-		rel, err := filepath.Rel(to, p)
-		if err == nil && !indexCovers(filepath.Join(from, rel), mount, indexRoot) {
-			dirs = append(dirs, p)
-		}
-		return nil
-	})
-	return dirs
-}
-
 func indexCovers(dir, mount, indexRoot string) bool {
 	rel, err := filepath.Rel(mount, dir)
 	if err != nil {
@@ -289,11 +329,11 @@ func indexCovers(dir, mount, indexRoot string) bool {
 // mkdir, not mkdir -p, so it fails when the parent is absent. The only question that matters
 // is whether this directory can be placed. Whether it has a database of its own is beside the
 // point: if it has none, marking it is how it gets one.
-func markChain(dir, mount, indexRoot string, trace bool) []string {
+func markChain(dir, mount, indexRoot string, trace bool, stat func(string) (uint64, bool)) []string {
 	cur := dir
 
 	for {
-		if _, ok := statDir(cur); ok {
+		if _, ok := stat(cur); ok {
 			break
 		}
 		if trace {
@@ -334,17 +374,20 @@ func markChain(dir, mount, indexRoot string, trace bool) []string {
 // itself. Duplicates do, so dedupe by inode.
 // ---------------------------------------------------------------------------
 
-func writeSuspects(dirs []string, mount, indexRoot, out string, trace bool) (int, error) {
+// writeSuspects writes the suspect file for dirs and returns how many directories it marks
+// and how many stats that took. cacheSize bounds the stat cache (see statCache).
+func writeSuspects(dirs []string, mount, indexRoot, out string, trace bool, cacheSize int) (marks, stats int, err error) {
 	seen := map[uint64]string{}
+	stat := newStatCache(cacheSize)
 	for _, d := range dirs {
-		for _, c := range markChain(d, mount, indexRoot, trace) {
-			if ino, ok := statDir(c); ok {
+		for _, c := range markChain(d, mount, indexRoot, trace, stat.stat) {
+			if ino, ok := stat.stat(c); ok {
 				seen[ino] = rel(c, mount)
 			}
 		}
 	}
 	if len(seen) == 0 {
-		return 0, nil
+		return 0, stat.stats, nil
 	}
 
 	var b strings.Builder
@@ -354,7 +397,7 @@ func writeSuspects(dirs []string, mount, indexRoot, out string, trace bool) (int
 			fmt.Printf("    %d d        # %s\n", ino, name)
 		}
 	}
-	return len(seen), writeFileAtomic(out, []byte(b.String()))
+	return len(seen), stat.stats, writeFileAtomic(out, []byte(b.String()))
 }
 
 func main() {
@@ -367,6 +410,8 @@ func main() {
 	every := flag.Duration("every", time.Minute, "how long a batch collects before it is made")
 	poll := flag.Duration("poll", 5*time.Second, "how often to look for new segments when there are none")
 	maxSegs := flag.Int("max-segments", 100, "most segments in one batch")
+	cacheSize := flag.Int("stat-cache", 200_000,
+		"most stat answers a batch keeps, least recently used dropped first (~150 bytes + path each)")
 	opens := flag.Bool("track-opens", false, "include open events, for atime")
 	once := flag.Bool("once", false, "process the segments there now and exit")
 	demo := flag.Bool("demo", false, "run the walk against a temp tree and exit")
@@ -376,8 +421,8 @@ func main() {
 		runDemo()
 		return
 	}
-	if *maxSegs < 1 || *every <= 0 || *poll <= 0 {
-		slog.Error("max-segments must be at least 1, every and poll above 0")
+	if *maxSegs < 1 || *cacheSize < 1 || *every <= 0 || *poll <= 0 {
+		slog.Error("max-segments and stat-cache must be at least 1, every and poll above 0")
 		os.Exit(2)
 	}
 
@@ -386,7 +431,7 @@ func main() {
 	r := &reader{
 		log: slog.Default(), spool: *spoolDir, statePath: *statePath, work: *work,
 		mount: filepath.Clean(*mount), index: filepath.Clean(*index), query: *query,
-		trackOpens: *opens, maxSegments: *maxSegs,
+		trackOpens: *opens, maxSegments: *maxSegs, statCacheSize: *cacheSize,
 	}
 	if err := r.run(ctx, *every, *poll, *once); err != nil {
 		slog.Error("markwalk stopped", "error", err)
