@@ -63,7 +63,7 @@ Delete the gRPC server; add the spool reader and the GUFI run.
 | Transport | `ReceiveEvents` gRPC server, `net.Listen`, `grpc.NewServer` | **Remove.** Replace with the reader loop below. |
 | Event → dirs | `dirsFor`, `linkedEntryID` | **Keep**, with §5's fixes (done: INVALID, inode changes, UNLINK). |
 | Batch set | `collector.add`, `pending`/`links` maps | **Keep**, fed by the reader. Rename the type (`batch`). |
-| Walk | `markChain`, `statDir`, `indexCovers` | **Keep unchanged.** |
+| Walk | `markChain`, `statCache` | **Keep unchanged.** |
 | Sibling lookup | `siblingDirs` | **Keep**; needs §6.3 to keep working after a rescan. |
 | Suspect file | `writeSuspects` | **Keep** (`<inode> d` lines, §6.1). |
 | GUFI | printed command | **Run it** (§6.2), per batch, in a work directory removed afterwards. |
@@ -93,7 +93,7 @@ for {
     }
 
     if b.empty() || runGUFI(b) == nil {             // §6.2: suspects, run, clean up
-        writeState(statePath, b.last)               // temp + fsync + rename
+        write state(statePath, b.last)              // renameio + fsync of the directory
         deleteSegments(spool, <= b.last)
         done = b.last
     }                                               // on failure: keep everything, retry later
@@ -160,12 +160,16 @@ Measured on a v8 cluster (2026-09-29), which the rows above rely on:
   the sibling query at `≥ 1`, everything else at `> 1`.
 
 These are implemented in `main.go` (`dirsFor`, `linkedEntryID`) with `main_test.go` covering each
-row. `validEntryID` still gates every entry ID before it reaches `gufi_query`, where it is
+row. `entryIDPattern` (BeeGFS's three 32-bit hex fields, or a reserved name) still gates every entry ID before it reaches `gufi_query`, where it is
 interpolated into SQL text.
 
 ---
 
 ## 6. Running the beegfs-index incremental update
+
+markwalk stops at the suspect file. Running the update is the job of whatever consumes
+`<work>/batch-*/suspects`, in batch order. This section describes that consumer. An earlier version
+that ran the update inside markwalk is kept on the local branch `markwalk-incremental-update`.
 
 ### 6.1 Suspect file
 
@@ -262,7 +266,7 @@ Unchanged from FLOW.md:
 - The three cases that look order-sensitive are handled structurally:
   - RENAME → both parents + common ancestor, so GUFI moves instead of delete+create;
   - MKDIR → the new directory too, so it gets a db.db;
-  - a directory replaced by a file → `statDir`'s type check refuses a non-directory inode.
+  - a directory replaced by a file → `statCache.stat`'s type check refuses a non-directory inode.
 
 So a batch may span any number of segments and metas: many segments → one suspect file → one run.
 
@@ -270,29 +274,25 @@ So a batch may span any number of segments and metas: many segments → one susp
 
 ## 9. Flags / CLI
 
-Status: **done** is in `main.go`/`reader.go`/`update.go` now; **later** is not built yet.
+Status: **done** is in `main.go`/`reader.go`; **consumer** belongs to whatever runs the update (§6), not markwalk.
 
 | flag | status | purpose |
 |---|---|---|
 | `-listen`, `-out` | removed | no longer a gRPC server; the suspect file lives in the batch directory |
 | `-spool` | done | the collector's segment directory |
 | `-state` | done | the last segment whose batch is done, and each meta's highest sequence ID |
-| `-work` | done | one directory per batch, `batch-<last segment>/`: the suspect file, and with `-update` the run's working directory, parking lot and `update.log`; removed after a successful update, renamed `batch-<N>.failed-<time>` after a failed one |
-| `-every` | done, new meaning | a batch starts at most this often, counted from the start of the one before, so a long update shortens the wait instead of adding to it (default 1m; minutes in production) |
+| `-work` | done | one directory per batch, `batch-<last segment>/suspects`; the consumer removes it once applied |
+| `-every` | done, new meaning | how long a batch collects before it is made (default 1m; minutes in production) |
 | `-poll` | done | how often to look again when there are no new segments (default 5s) |
 | `-max-segments` | done | most segments in one batch (default 100) |
 | `-once` | done | process the segments there now and exit (tests, cron) |
 | `-mount`,`-index`,`-query`,`-track-opens`,`-demo` | kept | unchanged |
-| `-update` | done | `gufi_incremental_update` binary. Set: it runs after every suspect file, from the batch directory, and only exit 0 finishes the batch (state moves). Unset: suspect files only, as before |
-| `-plugin` | done | the update's `--plugin`, `beegfs_index_ops:<lib>` (§6.2) |
-| `-tree` | done | the directory the index covers (default `-mount`); the update's index is `-index` at the same place below it |
-| `-threads` | done | the update's `-n` (default: CPUs, at most 16) |
-| `-update-timeout` | done | longest one update may run before it is killed and the batch tried again (default 1h). It walks the whole tree, so size it to the file system |
-| `-keep-failed` | done | failed batch directories kept for diagnosis (default 5) |
-| `-keep-segments` | later | do not delete processed segments (test clusters) |
-| `-dry-run` | later | write the suspect file and print the command; never run it, never move progress |
+| `-gufi`, `-threads` | consumer | `gufi_incremental_update` binary and its `-n` |
+| `-plugin` | consumer | `beegfs_index_ops:<lib>` (§6.2) |
+| `-keep-segments` | consumer | do not delete processed segments (test clusters) |
+| `-dry-run` | consumer | write the suspect file and print the command; never run it, never move progress |
 
-`-demo` (`demo.go`) stays as is; it exercises `writeSuspects` directly.
+`-demo` (`demo.go`) prints what `markChain` marks for five awkward trees.
 
 ---
 
@@ -303,6 +303,12 @@ Status: **done** is in `main.go`/`reader.go`/`update.go` now; **later** is not b
 - Reuse one `spool.Reader` buffer; the batch maps are O(distinct directories), not O(events).
 - The expensive steps are, in order: the GUFI run (§6.4, whole tree), the walk (a stat per level)
   and the sibling query. The last two are already once per batch; keep them there.
+- The sibling query passes its SQL to `gufi_query` as one argument, and Linux refuses any argument
+  of 128 KiB or more (E2BIG). An entry ID is at most 26 characters, so `siblingDirs` asks for
+  `idsPerQuery` (3,531) IDs per query, under 100 KiB. A batch of many multi-name files costs one
+  index walk per 3,531 IDs instead of losing all of them. A failed query loses only its own IDs,
+  with a warning.
+  Memory is O(distinct multi-name entry IDs) per batch, at worst about 1 GB for 10M.
 
 ---
 
@@ -315,21 +321,19 @@ Status: **done** is in `main.go`/`reader.go`/`update.go` now; **later** is not b
    `<work>/batch-<last>/suspects`, written atomically, and only then is the state file (also atomic)
    moved past it. A damaged segment stops markwalk with its state unchanged.
 3. Done: `ReceiveEvents`, `net.Listen`, `grpc.NewServer`, `-listen` and `-out` are gone.
-4. Done (`update.go`): the run (§6.2) with `-update`/`-plugin`/`-tree`, from the batch directory;
-   the state moves only after exit 0; a marked directory still without a db.db afterwards is a
-   warning; a finished batch's directory is removed, a failed one kept (`-keep-failed`) and the
-   batch made again after `-every`. Tested with a stand-in update (`update_test.go`) and on the VM
-   with `meta_race_test.py --index-soak`. `-dry-run` is still to do.
-5. Wire progress and retention: atomic state write after a successful run, then delete segments;
-   delete leftovers ≤ state at startup; `-keep-segments`.
+4. Out of scope for markwalk: the run (§6.2) lives in the consumer of the suspect files. markwalk's
+   state moves after the suspect file is written, so the consumer must apply batches in order and
+   track its own progress.
+5. Retention: segments ≤ the state can be deleted once the consumer has applied their batch; the
+   consumer owns this, not markwalk.
 6. Gap logging (§7): done, per meta, carried across restarts in the state file. Counters are later.
-7. beegfs-index: done, rebased onto upstream GUFI (§6.2, §6.3); markwalk passes `beegfs_index_ops`
-   with `-plugin`.
+7. beegfs-index: done, rebased onto upstream GUFI (§6.2, §6.3); the consumer passes `beegfs_index_ops`
+   with `--plugin`.
 8. Update `README.md` and `FLOW.md` (the picture becomes `collector → segments → markwalk → GUFI`;
    gap #1 is closed by §4).
 9. Tests: done for the reader (`reader_test.go`: batches, many segments to one batch, `.partial`
    left alone, holes across runs, a damaged segment, an empty batch). Still to add: a golden
-   segment covering every enum value, and the crash test once the run exists.
+   segment covering every enum value, and a crash test for the consumer.
 
 ---
 
