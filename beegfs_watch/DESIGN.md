@@ -224,8 +224,8 @@ carries `meta_id`, `seq_id` and the V1 or V2 event exactly as Watch sent it.
 - The segment number is strictly increasing; **consume in number order** to get arrival order.
   Parse the number rather than sorting names, so the order holds past ten digits.
 - Records within a segment are in arrival order.
-- The reference reader is the `spool` package (`spool.NewReader(f).Next()`); `spoolcat` prints
-  segments as JSON lines. Downstream readers should use it rather than parse bytes themselves.
+- The reference reader is the `spool` package (`spool.NewReader(f).Next()`). Downstream readers
+  should use it rather than parse bytes themselves.
 
 ---
 

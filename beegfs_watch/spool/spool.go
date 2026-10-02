@@ -6,13 +6,12 @@
 // so (MetaId, SeqId) identifies an event across replays.
 //
 // A sealed file (Ext) is complete and never changes. A file still being written
-// (Ext + PartialSuffix) can end part way through a record; Decode stops before
-// such a tail so it can be read again once the rest arrives.
+// (Ext + PartialSuffix) can end part way through a record, so only sealed files
+// are read.
 package spool
 
 import (
 	"bufio"
-	"bytes"
 	"cmp"
 	"errors"
 	"fmt"
@@ -36,6 +35,9 @@ const (
 	// number, Ext. The collector numbers files from 1 in the order it writes
 	// them, and carries on from the highest after a restart.
 	SegPrefix = "seg-"
+	// segDigits is the zero padding of a segment number. A wider number still
+	// parses: readers sort by number, not by name.
+	segDigits = 10
 )
 
 // Segment is a sealed spool file.
@@ -43,6 +45,9 @@ type Segment struct {
 	Number uint64
 	Path   string
 }
+
+// SegmentName returns the sealed name of segment n.
+func SegmentName(n uint64) string { return fmt.Sprintf("%s%0*d%s", SegPrefix, segDigits, n, Ext) }
 
 // SegmentNumber returns n for a sealed file named SegPrefix + n + Ext. Files
 // still being written, and names from before numbering, return false.
@@ -97,52 +102,16 @@ func (r *Reader) Next(ev *bw.Event) error {
 	return err
 }
 
-// Decode calls fn for each complete record at the start of data and returns
-// how many bytes those records took. A record cut off by the end of data is
-// not an error: consumed stops before it, and tail is true. That is how a file
-// still being written ends. An error from fn stops decoding and is returned.
-func Decode(data []byte, fn func(*bw.Event) error) (consumed int, tail bool, err error) {
-	br := bytes.NewReader(data)
-	for br.Len() > 0 {
-		ev := &bw.Event{}
-		if err := protodelim.UnmarshalFrom(br, ev); err != nil {
-			// Whatever follows the last good record is either a record still
-			// being written or damage; the caller knows which kind of file it has.
-			return consumed, true, nil
-		}
-		if err := fn(ev); err != nil {
-			return consumed, false, err
-		}
-		consumed = len(data) - br.Len()
+// SeqGap records seq as seen for meta in last and returns how many events are
+// missing just before it. A meta not in last starts at seq. A replay, at or
+// below the highest seen, misses nothing: Watch resends what was not acked.
+func SeqGap(last map[uint32]uint64, meta uint32, seq uint64) uint64 {
+	prev, ok := last[meta]
+	if !ok || seq > prev {
+		last[meta] = seq
 	}
-	return consumed, false, nil
-}
-
-// Line is an event flattened for people and scripts: spoolcat prints one per
-// line as JSON, with the field names the collector's old JSON files used.
-type Line struct {
-	Meta       uint32 `json:"meta"`
-	Seq        uint64 `json:"seq"`
-	Type       string `json:"type"`
-	Path       string `json:"path"`
-	TargetPath string `json:"target_path,omitempty"`
-	NumLinks   uint64 `json:"num_links,omitempty"`
-	EntryID    string `json:"entry_id,omitempty"`
-	ParentID   string `json:"parent_entry_id,omitempty"`
-	Timestamp  int64  `json:"ts,omitempty"`
-	Version    int    `json:"v,omitempty"` // 1 for a BeeGFS 7 event; omitted for v2
-}
-
-// ToLine flattens ev.
-func ToLine(ev *bw.Event) Line {
-	l := Line{Meta: ev.GetMetaId(), Seq: ev.GetSeqId()}
-	if v2 := ev.GetV2(); v2 != nil {
-		l.Type, l.Path, l.TargetPath = v2.GetType().String(), v2.GetPath(), v2.GetTargetPath()
-		l.NumLinks, l.EntryID, l.ParentID = v2.GetNumLinks(), v2.GetEntryId(), v2.GetParentEntryId()
-		l.Timestamp = v2.GetTimestamp()
-	} else if v1 := ev.GetV1(); v1 != nil {
-		l.Type, l.Path, l.TargetPath = v1.GetType().String(), v1.GetPath(), v1.GetTargetPath()
-		l.EntryID, l.ParentID, l.Version = v1.GetEntryId(), v1.GetParentEntryId(), 1
+	if !ok || seq <= prev+1 {
+		return 0
 	}
-	return l
+	return seq - prev - 1
 }

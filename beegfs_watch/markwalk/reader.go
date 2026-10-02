@@ -15,7 +15,7 @@ import (
 	"time"
 
 	"github.com/google/renameio/v2"
-	"github.com/thinkparq/beegfs-index/examples/watch-subscriber/spool"
+	"github.com/thinkparq/beegfs-index/beegfs_watch/spool"
 	bw "github.com/thinkparq/protobuf/go/beewatch"
 )
 
@@ -126,7 +126,7 @@ func (r *reader) process(st *state, segs []spool.Segment) error {
 	for _, s := range segs {
 		err := readSegment(s.Path, func(ev *bw.Event) {
 			events++
-			if n := seeSeq(seqs, ev.GetMetaId(), ev.GetSeqId()); n > 0 {
+			if n := spool.SeqGap(seqs, ev.GetMetaId(), ev.GetSeqId()); n > 0 {
 				missing += n
 				r.log.Warn("missing events: the spool has a hole, those directories may stay stale",
 					"meta", ev.GetMetaId(), "from", ev.GetSeqId()-n, "to", ev.GetSeqId()-1,
@@ -196,18 +196,4 @@ func readSegment(path string, fn func(*bw.Event)) error {
 		}
 		fn(&ev)
 	}
-}
-
-// seeSeq records seq for meta and returns how many events are missing just before it. A new
-// meta starts there; a replay at or below the highest seen, which follows a collector
-// restart, misses nothing.
-func seeSeq(seqs map[uint32]uint64, meta uint32, seq uint64) uint64 {
-	last, ok := seqs[meta]
-	if !ok || seq > last {
-		seqs[meta] = seq
-	}
-	if !ok || seq <= last+1 {
-		return 0
-	}
-	return seq - last - 1
 }

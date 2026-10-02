@@ -119,7 +119,7 @@ for {
 - **Retention is markwalk's job.** The collector never deletes. markwalk deletes a segment once its
   batch's rescan succeeded and the state file says so; at ~78 B per event, 1M events/s is ~280 GB an
   hour, so this is what keeps the spool bounded. `-keep-segments` turns it off for test clusters,
-  where `meta_race_test.py`, `loadgen verify` and `spoolcat` read the same spool.
+  where the test tools read the same spool.
 
 ---
 

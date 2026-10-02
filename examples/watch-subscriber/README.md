@@ -1,10 +1,10 @@
 # Watch subscriber examples
 
-Two small Go programs that read the BeeGFS Watch event stream. They are meant to be read in
-order: the first shows the protocol, the second shows what an index has to do with it.
+A small Go program that reads the BeeGFS Watch event stream and prints it, to show the
+protocol. The collector, markwalk and the spool reader built on it live in `beegfs_watch/`.
 
-Neither is part of the CMake build. They are a separate Go module so they can be built and run
-on their own.
+It is not part of the CMake build. It is a separate Go module so it can be built and run on
+its own.
 
 ```bash
 cd examples/watch-subscriber
@@ -26,41 +26,14 @@ go run ./subscriber --listen 0.0.0.0:50052
 
 Then make something happen on the mount. Events appear a moment later.
 
-## markwalk/
+## Next steps
 
-The next job: turning those events into the input GUFI's incremental update wants.
+`beegfs_watch/` turns the stream into input for GUFI's incremental update:
 
-GUFI does not take paths. It takes a suspect file of `<inode> d` lines and rescans exactly
-those directories. Three stages sit in between, and each one can lose data quietly.
+| program | what it does | design |
+|---|---|---|
+| `collector/` | receives Watch events and seals them into numbered segment files | `DESIGN.md` |
+| `markwalk/` | turns each batch of segments into a `<inode> d` suspect file | `markwalk/DESIGN.md`, `markwalk/FLOW.md` |
 
-```
-an event names a path   ->  which directories does it dirty?
-a directory             ->  is it still there, and does the index know its parents?
-a set of directories    ->  "<inode> d" lines
-```
-
-```bash
-go run ./markwalk -mount /mnt/beegfs -index /var/lib/gufi -out /tmp/suspects
-```
-
-Every few seconds it prints what it marked and the `gufi_incremental_update` command to run
-with the file.
-
-No cluster to hand? This builds small trees in a temp directory and runs the same walk over
-five awkward cases, printing each step:
-
-```bash
-go run ./markwalk -demo
-```
-
-`markwalk/FLOW.md` is the design in plain text: the flow, the per-event rules, the walk, a
-worked example, and the known gaps.
-
-## What to read for what
-
-| question | look at |
-|---|---|
-| how do I receive events at all | `subscriber/main.go` |
-| what does each event type mean for an index | `markwalk/main.go`, part 1 |
-| why walk up the tree | `markwalk/main.go`, part 2, and FLOW.md |
-| what could go wrong | FLOW.md, "Known gaps" |
+No cluster to hand? `go run ./markwalk -demo` (from `beegfs_watch/`) builds small trees in a
+temp directory and shows what the walk marks in five awkward cases.

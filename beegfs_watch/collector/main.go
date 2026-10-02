@@ -3,7 +3,7 @@
 //
 // Events are appended, exactly as Watch sent them, to seg-<N>.binpb.partial:
 // protobuf binary, each record prefixed with its length (protodelim). The spool
-// package reads them, and spoolcat prints them as JSON. When a file holds enough
+// package reads them. When a file holds enough
 // events, or has been open long enough, it is handed to a sealer, which fsyncs
 // it, gives it its final seg-<N>.binpb name, fsyncs the directory, and only then
 // acks its events back to Watch. A sealed file is therefore complete and on
@@ -41,44 +41,17 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"syscall"
 	"time"
 
 	"github.com/thinkparq/beegfs-go/watch/pkg/subscriber"
+	"github.com/thinkparq/beegfs-index/beegfs_watch/spool"
 	bw "github.com/thinkparq/protobuf/go/beewatch"
 	"go.uber.org/zap"
 	"google.golang.org/protobuf/encoding/protowire"
 	"google.golang.org/protobuf/proto"
 )
-
-// A sealed spool file is segPrefix, a zero-padded number and spoolExt; one
-// still being written adds partialSuffix. Readers match these names, so they
-// must not change.
-const (
-	segPrefix     = "seg-"
-	segDigits     = 10
-	spoolExt      = ".binpb"
-	partialSuffix = ".partial"
-)
-
-// segName is the sealed name of spool file n.
-func segName(n uint64) string { return fmt.Sprintf("%s%0*d%s", segPrefix, segDigits, n, spoolExt) }
-
-// segNumber returns n for a sealed file named segName(n).
-func segNumber(name string) (uint64, bool) {
-	digits, ok := strings.CutPrefix(name, segPrefix)
-	if !ok {
-		return 0, false
-	}
-	digits, ok = strings.CutSuffix(digits, spoolExt)
-	if !ok || digits == "" {
-		return 0, false
-	}
-	n, err := strconv.ParseUint(digits, 10, 64)
-	return n, err == nil
-}
 
 // seqTracker finds holes in each meta's sequence IDs. Only the receive loop
 // uses it.
@@ -107,15 +80,10 @@ func newSeqTracker(checkpoint map[uint32]uint64) *seqTracker {
 // see records seq for meta and returns how many events were skipped just
 // before it. A replay (seq at or below the highest seen) skips nothing.
 func (t *seqTracker) see(meta uint32, seq uint64) uint64 {
-	last, ok := t.last[meta]
-	if !ok || seq > last {
-		t.last[meta] = seq
+	n := spool.SeqGap(t.last, meta, seq)
+	if n > 0 {
+		t.missing[meta] += n
 	}
-	if !ok || seq <= last+1 {
-		return 0
-	}
-	n := seq - last - 1
-	t.missing[meta] += n
 	return n
 }
 
@@ -162,11 +130,11 @@ func (c *collector) prepare() error {
 		return err
 	}
 	for _, e := range old {
-		if n, ok := segNumber(e.Name()); ok {
+		if n, ok := spool.SegmentNumber(e.Name()); ok {
 			c.last = max(c.last, n)
 			continue
 		}
-		if !strings.HasSuffix(e.Name(), partialSuffix) {
+		if !strings.HasSuffix(e.Name(), spool.PartialSuffix) {
 			continue
 		}
 		// Its events were never acked, so Watch replays them into a new file.
@@ -189,8 +157,8 @@ func (c *collector) add(ev *bw.Event) error {
 		// O_EXCL here and the sealer's link, which refuses to replace a file,
 		// make a reused number an error rather than a lost file.
 		c.last++
-		name := segName(c.last)
-		f, err := os.OpenFile(filepath.Join(c.dir, name+partialSuffix), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+		name := spool.SegmentName(c.last)
+		f, err := os.OpenFile(filepath.Join(c.dir, name+spool.PartialSuffix), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
 		if err != nil {
 			return err
 		}
@@ -252,7 +220,7 @@ func (c *collector) seal(fl *file, dir *os.File, high map[uint32]uint64) error {
 	if err := fl.f.Close(); err != nil {
 		return fmt.Errorf("close %s: %w", fl.name, err)
 	}
-	partial := filepath.Join(c.dir, fl.name+partialSuffix)
+	partial := filepath.Join(c.dir, fl.name+spool.PartialSuffix)
 	// Link, not rename: rename silently replaces an existing file, and every
 	// event in a sealed file has already been acked.
 	if err := os.Link(partial, filepath.Join(c.dir, fl.name)); err != nil {
@@ -324,7 +292,7 @@ func (c *collector) run(ctx context.Context, every time.Duration) error {
 
 func main() {
 	listen := flag.String("listen", "0.0.0.0:50052", "address Watch dials into")
-	dir := flag.String("spool", "/var/lib/index-sync/spool", "spool directory for "+spoolExt+" files")
+	dir := flag.String("spool", "/var/lib/index-sync/spool", "spool directory for "+spool.Ext+" files")
 	ckpt := flag.String("checkpoint", "/var/lib/index-sync/checkpoint.json", "acked sequence IDs")
 	ackEvery := flag.Duration("checkpoint-every", time.Second, "how often acks reach Watch and disk; Watch frees buffer space only then")
 	rollEvery := flag.Duration("roll-every", 30*time.Second, "seal the open file at least this often")
