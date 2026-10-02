@@ -3,6 +3,8 @@ module github.com/thinkparq/beegfs-index/examples/watch-subscriber
 go 1.26.4
 
 require (
+	github.com/google/renameio/v2 v2.0.2
+	github.com/hashicorp/golang-lru/v2 v2.0.7
 	github.com/thinkparq/protobuf v0.8.5-0.20260901112913-25d79b6293ee
 	google.golang.org/grpc v1.81.1
 	google.golang.org/protobuf v1.36.11

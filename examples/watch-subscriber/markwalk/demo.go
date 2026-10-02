@@ -22,13 +22,12 @@ func runDemo() {
 		index := filepath.Join(tmp, d.name, "index")
 		d.setup(mount, index)
 
-		fmt.Printf("\n%s\n  event names: %s\n", d.title, d.mark)
-		if _, _, err := writeSuspects(
-			[]string{filepath.Join(mount, d.mark)}, mount, index,
-			filepath.Join(tmp, d.name, "suspects"), true, 1024,
-		); err != nil {
-			fmt.Println("  ", err)
+		fmt.Printf("\n%s\n  event names: %s\n  marks:", d.title, d.mark)
+		for _, c := range markChain(filepath.Join(mount, d.mark), mount, index, newStatCache(64).stat) {
+			r, _ := filepath.Rel(mount, c)
+			fmt.Printf(" %s", r)
 		}
+		fmt.Println()
 	}
 }
 

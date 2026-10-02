@@ -1,8 +1,5 @@
 package main
 
-// Part 4: the reader. The collector seals numbered segment files; markwalk takes the new ones
-// in number order, turns each batch of them into one suspect file, and records how far it got.
-
 import (
 	"context"
 	"encoding/json"
@@ -17,17 +14,16 @@ import (
 	"slices"
 	"time"
 
+	"github.com/google/renameio/v2"
 	"github.com/thinkparq/beegfs-index/examples/watch-subscriber/spool"
 	bw "github.com/thinkparq/protobuf/go/beewatch"
 )
 
-// state is how far markwalk got, kept in one small file.
+// state is how far markwalk got.
 type state struct {
-	// Segment is the number of the last segment whose batch is done. The next run starts after
-	// it. "Done" means its suspect file is on disk and, with -update, the index has it too.
+	// Segment is the last segment whose suspect file is written; the next batch starts after it.
 	Segment uint64 `json:"segment"`
-	// Seqs is each meta's highest sequence ID seen, so a hole across batches and restarts is
-	// still found.
+	// Seqs is each meta's highest sequence ID seen, so holes are found across batches and restarts.
 	Seqs map[uint32]uint64 `json:"seqs"`
 }
 
@@ -38,7 +34,7 @@ func readState(path string) (state, error) {
 		return st, nil
 	}
 	if err != nil {
-		return st, err
+		return st, fmt.Errorf("read state: %w", err)
 	}
 	if err := json.Unmarshal(data, &st); err != nil {
 		return st, fmt.Errorf("%s: %w", path, err)
@@ -49,38 +45,15 @@ func readState(path string) (state, error) {
 	return st, nil
 }
 
-func writeState(path string, st state) error {
-	data, err := json.Marshal(st)
-	if err != nil {
-		return err
-	}
-	return writeFileAtomic(path, append(data, '\n'))
-}
-
-// writeFileAtomic replaces path with data so that a crash leaves either the old file or the
-// new one, never part of either: temp file, fsync, rename, fsync the directory.
-func writeFileAtomic(path string, data []byte) error {
+// writeFileDurable replaces path with data so that after a crash it holds either the old or
+// the new content. renameio writes, fsyncs and renames a temp file; the directory is then
+// fsynced too, so the rename itself survives a crash before the state file moves past it.
+func writeFileDurable(path string, data []byte) error {
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
-	f, err := os.CreateTemp(dir, filepath.Base(path)+".tmp-*")
-	if err != nil {
-		return err
-	}
-	defer os.Remove(f.Name()) // a no-op once renamed
-	if _, err := f.Write(data); err != nil {
-		f.Close()
-		return err
-	}
-	if err := f.Sync(); err != nil {
-		f.Close()
-		return err
-	}
-	if err := f.Close(); err != nil {
-		return err
-	}
-	if err := os.Rename(f.Name(), path); err != nil {
+	if err := renameio.WriteFile(path, data, 0o644, renameio.WithTempDir(dir)); err != nil {
 		return err
 	}
 	d, err := os.Open(dir)
@@ -102,15 +75,11 @@ type reader struct {
 	query         string // gufi_query, for the sibling lookup
 	trackOpens    bool
 	maxSegments   int
-	statCacheSize int      // most stat answers a batch keeps, see statCache
-	update        *updater // nil: write suspect files only
+	statCacheSize int
 }
 
-// run processes new segments until ctx is done. With once it processes what is there now and
-// returns. A batch starts at most every `every`, counted from the start of the one before, so
-// a long incremental update eats into the wait instead of adding to it; with nothing new it
-// looks again after poll. A failed update keeps the state and tries the batch again after
-// every (with once, it stops markwalk).
+// run makes batches until ctx is done, waiting every between batches and poll when there is
+// nothing new. With once it makes batches of what is there now and returns.
 func (r *reader) run(ctx context.Context, every, poll time.Duration, once bool) error {
 	st, err := readState(r.statePath)
 	if err != nil {
@@ -127,22 +96,15 @@ func (r *reader) run(ctx context.Context, every, poll time.Duration, once bool) 
 		}
 		wait := poll
 		if len(segs) > 0 {
-			began := time.Now()
-			err := r.process(ctx, &st, segs)
-			switch {
-			case ctx.Err() != nil:
-				return nil // stopping; a batch cut short is made again next start
-			case errors.Is(err, errUpdate) && !once:
-				r.log.Error("batch not done, trying again", "error", err, "in", every)
-			case err != nil:
+			if err := r.process(&st, segs); err != nil {
 				return err
 			}
-			wait = max(every-time.Since(began), 0)
+			wait = every
 		} else if once {
 			return nil
 		}
 		if once {
-			continue // take the next batch now
+			continue
 		}
 		select {
 		case <-ctx.Done():
@@ -152,15 +114,13 @@ func (r *reader) run(ctx context.Context, every, poll time.Duration, once bool) 
 	}
 }
 
-// process makes one batch of segs, writes its suspect file, and only then moves st past it. A
-// crash before the state write repeats the batch; it writes the same file again, which is
-// harmless.
-func (r *reader) process(ctx context.Context, st *state, segs []spool.Segment) error {
+// process writes the suspect file for segs, then moves st past them. A crash in between
+// repeats the batch, which writes the same file again.
+func (r *reader) process(st *state, segs []spool.Segment) error {
 	first, last := segs[0].Number, segs[len(segs)-1].Number
 	seqs := maps.Clone(st.Seqs)
 	dirs := map[string]struct{}{}
-	// Entry IDs of files with more than one name; the index supplies where the others are.
-	links := map[string]struct{}{}
+	links := map[string]struct{}{} // entry IDs of multi-name files, see siblingDirs
 	var events, v1, missing uint64
 
 	for _, s := range segs {
@@ -174,7 +134,7 @@ func (r *reader) process(ctx context.Context, st *state, segs []spool.Segment) e
 			}
 			v2 := ev.GetV2()
 			if v2 == nil {
-				v1++ // a BeeGFS 7 event; not used
+				v1++ // BeeGFS 7 format, not used
 				return
 			}
 			ds, id := dirsFor(v2, r.mount, r.trackOpens)
@@ -190,63 +150,34 @@ func (r *reader) process(ctx context.Context, st *state, segs []spool.Segment) e
 		}
 	}
 
-	// One query for the whole batch, not one per event.
 	marked := append(slices.Collect(maps.Keys(dirs)),
 		siblingDirs(slices.Collect(maps.Keys(links)), r.mount, r.index, r.query)...)
-	dir := filepath.Join(r.work, fmt.Sprintf("batch-%010d", last))
-	out := filepath.Join(dir, "suspects")
-	marks, stats, err := writeSuspects(marked, r.mount, r.index, out, false, r.statCacheSize)
+	out := filepath.Join(r.work, fmt.Sprintf("batch-%010d", last), "suspects")
+	marks, stats, err := writeSuspects(marked, r.mount, r.index, out, r.statCacheSize)
 	if err != nil {
 		return fmt.Errorf("write %s: %w", out, err)
 	}
 
-	var took time.Duration
-	uncovered := 0
-	if r.update != nil && marks > 0 {
-		began := time.Now()
-		if err := r.update.run(ctx, dir, out); err != nil {
-			if errors.Is(err, errUpdate) {
-				if kept, kerr := r.update.keepFailedBatch(r.work, dir); kerr == nil {
-					err = fmt.Errorf("%w (batch kept in %s)", err, kept)
-				}
-			}
-			return fmt.Errorf("segments %d-%d: %w", first, last, err)
-		}
-		took = time.Since(began)
-		if u := r.update.uncovered(marked, r.mount, r.index); len(u) > 0 {
-			uncovered = len(u)
-			r.log.Warn("marked directories still without a db.db after the update",
-				"count", len(u), "first", u[0])
-		}
-	}
-
 	st.Segment, st.Seqs = last, seqs
-	if err := writeState(r.statePath, *st); err != nil {
+	data, err := json.Marshal(st)
+	if err == nil {
+		err = writeFileDurable(r.statePath, append(data, '\n'))
+	}
+	if err != nil {
 		return fmt.Errorf("write %s: %w", r.statePath, err)
 	}
 
 	if marks == 0 {
 		out = "none: nothing left to mark"
 	}
-	attrs := []any{"first_segment", first, "last_segment", last, "segments", len(segs),
+	r.log.Info("batch done", "first_segment", first, "last_segment", last, "segments", len(segs),
 		"events", events, "directories", len(dirs), "multi_name_inodes", len(links), "marks", marks,
-		"stats", stats, "v1_events_skipped", v1, "missing_events", missing}
-	if r.update != nil {
-		// The batch is in the index now; its suspect file, log and parking lot are not needed.
-		if err := os.RemoveAll(dir); err != nil {
-			r.log.Warn("could not remove a finished batch", "dir", dir, "error", err)
-		}
-		attrs = append(attrs, "updated", marks > 0, "update_took", took.Round(time.Millisecond),
-			"uncovered", uncovered)
-	} else {
-		attrs = append(attrs, "suspects", out)
-	}
-	r.log.Info("batch done", attrs...)
+		"stats", stats,
+		"v1_events_skipped", v1, "missing_events", missing, "suspects", out)
 	return nil
 }
 
-// readSegment calls fn for every event in one sealed segment. The event is reused between
-// calls, so fn must not keep it.
+// readSegment calls fn for every event in a segment. fn must not keep the event, which is reused.
 func readSegment(path string, fn func(*bw.Event)) error {
 	f, err := os.Open(path)
 	if err != nil {
@@ -267,9 +198,9 @@ func readSegment(path string, fn func(*bw.Event)) error {
 	}
 }
 
-// seeSeq records seq for meta in seqs and returns how many events were skipped just before
-// it. A meta seen for the first time starts there, and a replay (at or below the highest seen)
-// skips nothing: the collector can write an event twice after it restarts.
+// seeSeq records seq for meta and returns how many events are missing just before it. A new
+// meta starts there; a replay at or below the highest seen, which follows a collector
+// restart, misses nothing.
 func seeSeq(seqs map[uint32]uint64, meta uint32, seq uint64) uint64 {
 	last, ok := seqs[meta]
 	if !ok || seq > last {
