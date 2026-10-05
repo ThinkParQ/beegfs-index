@@ -540,9 +540,16 @@ static int apply_creates_and_move_ins(sqlite3 *db, struct GenSnapshot *index) {
 }
 
 struct UpdateDir {
-    str_t treepath;
+    str_t treepath;              /* relative to the tree's parent, like the snapshot paths */
     str_t treeinode;
     struct GenSnapshot *index;
+    struct GenSnapshot *tree;    /* puts the tree's parent back in front of treepath */
+};
+
+/* apply_updates_callback() needs both sides to build an UpdateDir */
+struct ApplyUpdatesArgs {
+    struct GenSnapshot *index;
+    struct GenSnapshot *tree;
 };
 
 static void free_ud(struct UpdateDir *ud) {
@@ -600,8 +607,18 @@ static int apply_update(QPTPool_ctx_t *ctx, void *data) {
              * instead of actually deleting it. Not sure how to handle
              * with suspect time.
              */
-            struct work *work = new_work_with_name(NULL, 0, ud->treepath.data, ud->treepath.len);
-            work->basename_len = ud->treepath.len - dirname_len(ud->treepath.data, ud->treepath.len);
+            /*
+             * treepath is relative to the tree's parent, as stored in the
+             * snapshots, so put that parent back like the index path above;
+             * otherwise lstat resolves it against the working directory
+             */
+            char treepath[MAXPATH];
+            const size_t treepath_len = SNFORMAT_S(treepath, sizeof(treepath), 2,
+                                                   ud->tree->work->name, ud->tree->parent_len, /* parent comes with trailing slash */
+                                                   ud->treepath.data, ud->treepath.len);
+
+            struct work *work = new_work_with_name(NULL, 0, treepath, treepath_len);
+            work->basename_len = treepath_len - dirname_len(treepath, treepath_len);
 
             /* inode is already known, but need to lstat for remaining values */
             if (lstat_wrapper(work->name, &work->statuso, &work->crtime,
@@ -609,7 +626,7 @@ static int apply_update(QPTPool_ctx_t *ctx, void *data) {
                 DIR *dir = opendir_wrapper(work->name, NULL);
                 if (dir) {
                     struct entry_data ed = {0};
-                    const int rc = reindex_dir(pa->ctx, work, &ed, dir);
+                    const int rc = reindex_dir(ctx, work, &ed, dir);
                     closedir(dir);
                     free(work);
 
@@ -704,8 +721,8 @@ static int apply_update(QPTPool_ctx_t *ctx, void *data) {
 static int apply_updates_callback(void *args, int count, char **data, char **columns) {
     (void) count; (void) columns;
 
-    struct GenSnapshot *index = (struct GenSnapshot *) args;
-    struct PoolArgs *pa = index->pa;
+    struct ApplyUpdatesArgs *aua = (struct ApplyUpdatesArgs *) args;
+    struct PoolArgs *pa = aua->index->pa;
 
     /* const char *indexpath  = data[0]; */
     /* const char *treepath   = data[1]; */
@@ -725,20 +742,27 @@ static int apply_updates_callback(void *args, int count, char **data, char **col
     str_alloc_existing(&ud->treeinode, strlen(treeinode));
     memcpy(ud->treeinode.data, treeinode, ud->treeinode.len);
 
-    ud->index = index;
+    ud->index = aua->index;
+    ud->tree = aua->tree;
 
     QPTPool_enqueue(pa->ctx, apply_update, ud);
 
     return 0;
 }
 
-static int apply_updates(struct PoolArgs *pa, sqlite3 *db, struct GenSnapshot *index) {
+static int apply_updates(struct PoolArgs *pa, sqlite3 *db,
+                         struct GenSnapshot *index, struct GenSnapshot *tree) {
     fprintf(stdout, "Start updating databases and directories\n");
+
+    struct ApplyUpdatesArgs aua = {
+        .index = index,
+        .tree  = tree,
+    };
 
     char *err = NULL;
     if (sqlite3_exec(db, GET_UPDATES,
                      apply_updates_callback,
-                     index, &err) != SQLITE_OK) {
+                     &aua, &err) != SQLITE_OK) {
         sqlite_print_err_and_free(err, stderr, "Could not get updates from diff table: %s\n", err);
         return 1;
     }
@@ -776,7 +800,7 @@ int incremental_update(struct PoolArgs *pa, const ino_t inode, struct GenSnapsho
     const int ret = !(
         (apply_removes_and_move_outs(db, index) == 0) &&
         (apply_creates_and_move_ins(db, index) == 0) &&
-        (apply_updates(pa, db, index) == 0)
+        (apply_updates(pa, db, index, tree) == 0)
     );
 
     closedb(db);
