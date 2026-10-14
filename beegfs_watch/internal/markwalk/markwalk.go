@@ -1,21 +1,16 @@
-// markwalk turns the collector's segment files into GUFI suspect files.
+// Package markwalk turns the collector's segment files into GUFI suspect files.
 //
 // It reads sealed segments in number order and turns each batch into one "<inode> d" line per
 // directory to rescan, written to <work>/batch-<last segment>/suspects. Only then does the
 // state file move past the batch, so a crash repeats a batch and never skips one. Running
-// gufi_incremental_update on the file is up to whatever consumes it (DESIGN.md §6).
-//
-//	go run ./markwalk -spool /local/bt/collector/spool -mount /mnt/beegfs -index /var/lib/gufi
-package main
+// gufi_incremental_update on the file is up to beegfs index update.
+package markwalk
 
 import (
 	"context"
-	"flag"
 	"fmt"
-	"log/slog"
 	"os"
 	"os/exec"
-	"os/signal"
 	"path/filepath"
 	"regexp"
 	"slices"
@@ -25,7 +20,48 @@ import (
 
 	"github.com/hashicorp/golang-lru/v2/simplelru"
 	bw "github.com/thinkparq/protobuf/go/beewatch"
+	"go.uber.org/zap"
 )
+
+// Config holds markwalk's configuration.
+type Config struct {
+	// Spool is the directory the collector writes segment files to.
+	Spool string
+	// State is the file recording the last segment whose suspect file was written.
+	State string
+	// Work is the directory each batch's suspect file is written to, as batch-<N>/suspects.
+	Work string
+	// Mount is the path where BeeGFS is mounted, so event paths can be made absolute.
+	Mount string
+	// Index is the GUFI index root.
+	Index string
+	// Query is the gufi_query binary used to find the other names of a multi-link inode. Empty
+	// disables the lookup.
+	Query string
+	// Every is the least time between batches.
+	Every time.Duration
+	// Poll is how often to look for new segments when nobody nudges.
+	Poll time.Duration
+	// MaxSegments is the most segments in one batch.
+	MaxSegments int
+	// StatCache is the most stat results a batch keeps.
+	StatCache int
+	// TrackOpens includes open events so atime changes are indexed.
+	TrackOpens bool
+	// Retain removes segments once their suspect file is written, keeping the newest.
+	Retain bool
+	// Once makes batches of the segments present now and returns.
+	Once bool
+}
+
+// Run makes batches until ctx is done. A nudge on sealed means the collector sealed a
+// segment; with sealed nil it polls every cfg.Poll instead. Run returns only when ctx is
+// done, or at once with cfg.Once; a failed batch is retried after a growing delay, so that
+// nothing is skipped and the collector sharing the process is never stopped.
+func Run(ctx context.Context, cfg Config, log *zap.Logger, sealed <-chan struct{}) error {
+	cfg.Mount, cfg.Index = filepath.Clean(cfg.Mount), filepath.Clean(cfg.Index)
+	return (&reader{Config: cfg, log: log}).run(ctx, sealed)
+}
 
 // dirsFor returns the directories an event dirties and, when the inode has other names, its
 // entry ID so siblingDirs can find them. A listing change dirties the parent. An inode change
@@ -110,7 +146,7 @@ const idsPerQuery = (100 << 10) / 29
 // siblingDirs asks the index which directories list these entry IDs, through the
 // beegfs_entries table the BeeGFS plugin fills in. Every query walks the whole index, so
 // it asks for as many IDs at once as fit; a failed query loses only its own IDs.
-func siblingDirs(entryIDs []string, mount, indexRoot, queryBin string) []string {
+func siblingDirs(ctx context.Context, log *zap.Logger, entryIDs []string, mount, indexRoot, queryBin string) []string {
 	if queryBin == "" {
 		return nil
 	}
@@ -118,10 +154,10 @@ func siblingDirs(entryIDs []string, mount, indexRoot, queryBin string) []string 
 	seen := map[string]bool{}
 	for chunk := range slices.Chunk(entryIDs, idsPerQuery) {
 		sql := "SELECT path() FROM beegfs_entries WHERE entry_id IN ('" + strings.Join(chunk, "','") + "');"
-		out, err := exec.Command(queryBin, "-d", "\n", "-E", sql, indexRoot).Output()
+		out, err := exec.CommandContext(ctx, queryBin, "-d", "\n", "-E", sql, indexRoot).Output()
 		if err != nil {
-			slog.Warn("sibling lookup failed; other names of these multi-name files keep a stale size",
-				"entry_ids", len(chunk), "error", err)
+			log.Warn("sibling lookup failed; other names of these multi-name files keep a stale size",
+				zap.Int("entry_ids", len(chunk)), zap.Error(err))
 			continue
 		}
 		for _, line := range strings.Split(string(out), "\n") {
@@ -239,43 +275,4 @@ func commonAncestor(a, b string) string {
 // within reports whether path is root or below it.
 func within(path, root string) bool {
 	return path == root || strings.HasPrefix(path, root+string(filepath.Separator))
-}
-
-func main() {
-	spoolDir := flag.String("spool", "/var/lib/index-sync/spool", "the collector's segment directory")
-	statePath := flag.String("state", "/var/lib/index-sync/markwalk.json", "how far markwalk got")
-	work := flag.String("work", "/var/lib/index-sync/markwalk", "where each batch's suspect file goes")
-	mount := flag.String("mount", "/mnt/beegfs", "the BeeGFS mount, so paths can be made absolute")
-	index := flag.String("index", "/var/lib/gufi", "GUFI index root")
-	query := flag.String("query", "gufi_query", "gufi_query binary, used to find the other names of a multi-link inode")
-	every := flag.Duration("every", time.Minute, "how long a batch collects before it is made")
-	poll := flag.Duration("poll", 5*time.Second, "how often to look for new segments when there are none")
-	maxSegs := flag.Int("max-segments", 100, "most segments in one batch")
-	cacheSize := flag.Int("stat-cache", 200_000,
-		"most stat answers a batch keeps, least recently used dropped first (~150 bytes + path each)")
-	opens := flag.Bool("track-opens", false, "include open events, for atime")
-	once := flag.Bool("once", false, "process the segments there now and exit")
-	demo := flag.Bool("demo", false, "run the walk against a temp tree and exit")
-	flag.Parse()
-
-	if *demo {
-		runDemo()
-		return
-	}
-	if *maxSegs < 1 || *cacheSize < 1 || *every <= 0 || *poll <= 0 {
-		slog.Error("max-segments and stat-cache must be at least 1, every and poll above 0")
-		os.Exit(2)
-	}
-
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-	r := &reader{
-		log: slog.Default(), spool: *spoolDir, statePath: *statePath, work: *work,
-		mount: filepath.Clean(*mount), index: filepath.Clean(*index), query: *query,
-		trackOpens: *opens, maxSegments: *maxSegs, statCacheSize: *cacheSize,
-	}
-	if err := r.run(ctx, *every, *poll, *once); err != nil {
-		slog.Error("markwalk stopped", "error", err)
-		os.Exit(1)
-	}
 }

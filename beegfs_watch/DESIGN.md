@@ -22,7 +22,7 @@ The final on-disk format does **not** need to be human-readable. A separate down
 reads the files and knows how to decode them. This removes any need for parsing/transformation in
 the collector and is the single most important simplifying constraint (see §4, D1).
 
-The existing example (`collector/main.go`) is a correctness-first sketch: it JSON-encodes one event
+The first example (since replaced by `internal/collector/`) was a correctness-first sketch: it JSON-encodes one event
 at a time straight to an unbuffered file and only acks every 30 s. It is not built for this rate.
 This document describes the design that is.
 

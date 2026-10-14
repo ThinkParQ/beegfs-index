@@ -28,12 +28,12 @@ Then make something happen on the mount. Events appear a moment later.
 
 ## Next steps
 
-`beegfs_watch/` turns the stream into input for GUFI's incremental update:
+`beegfs_watch/` turns the stream into input for GUFI's incremental update. One binary,
+`cmd/beegfs-index-sync`, runs both halves (`--mode both`, the default) or either one alone:
 
-| program | what it does | design |
+| package | what it does | design |
 |---|---|---|
-| `collector/` | receives Watch events and seals them into numbered segment files | `DESIGN.md` |
-| `markwalk/` | turns each batch of segments into a `<inode> d` suspect file | `markwalk/DESIGN.md`, `markwalk/FLOW.md` |
+| `internal/collector/` | receives Watch events and seals them into numbered segment files | `DESIGN.md` |
+| `internal/markwalk/` | turns each batch of segments into a `<inode> d` suspect file | `internal/markwalk/DESIGN.md`, `FLOW.md` |
 
-No cluster to hand? `go run ./markwalk -demo` (from `beegfs_watch/`) builds small trees in a
-temp directory and shows what the walk marks in five awkward cases.
+How the two share one process: `MERGE-DESIGN.md`.
