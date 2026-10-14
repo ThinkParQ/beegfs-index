@@ -1,6 +1,7 @@
 # markwalk redesign — consume the collector's segment files
 
-Related: `../DESIGN.md` (the collector that produces the segment files), `./FLOW.md` (the
+Related: `../../DESIGN.md` (the collector that produces the segment files), `../../MERGE-DESIGN.md`
+(how collector and markwalk share one binary, `beegfs-index-sync`), `./FLOW.md` (the
 event→suspect-file logic), ThinkParQ/beegfs-index issue #5.
 
 ---
@@ -9,10 +10,11 @@ event→suspect-file logic), ThinkParQ/beegfs-index issue #5.
 
 Today `markwalk` **is a gRPC subscriber**: Watch dials into it and it processes events live
 (`ReceiveEvents`). In the new architecture the **collector** owns the gRPC endpoint and persists
-events to **numbered segment files**; `markwalk` becomes a **reader of those files** that runs the
-beegfs-index `gufi_incremental_update` itself and only then moves its place forward. The
-event→directory logic (Parts 1–3) is kept, with the fixes in §5; the input source, progress and the
-GUFI run change.
+events to **numbered segment files**; `markwalk` becomes a **reader of those files** that writes one
+suspect file per batch and only then moves its place forward; running `gufi_incremental_update`
+stayed with `beegfs index update` (§11.4). Since the merge (`../../MERGE-DESIGN.md`) both are
+packages of one binary, `cmd/beegfs-index-sync`. The event→directory logic (Parts 1–3) is kept,
+with the fixes in §5; the input source and progress change.
 
 ```
 BEFORE:  Watch ──gRPC──► markwalk (subscriber) ──► suspect file ──► (operator runs GUFI)
@@ -58,7 +60,7 @@ record:     [uvarint len][bw.Event]                          protodelim; meta_id
 
 Delete the gRPC server; add the spool reader and the GUFI run.
 
-| Concern | Current (`main.go`) | Change |
+| Concern | Current (`markwalk.go`) | Change |
 |---|---|---|
 | Transport | `ReceiveEvents` gRPC server, `net.Listen`, `grpc.NewServer` | **Remove.** Replace with the reader loop below. |
 | Event → dirs | `dirsFor`, `linkedEntryID` | **Keep**, with §5's fixes (done: INVALID, inode changes, UNLINK). |
@@ -66,37 +68,26 @@ Delete the gRPC server; add the spool reader and the GUFI run.
 | Walk | `markChain`, `statCache` | **Keep unchanged.** |
 | Sibling lookup | `siblingDirs` | **Keep**; needs §6.3 to keep working after a rescan. |
 | Suspect file | `writeSuspects` | **Keep** (`<inode> d` lines, §6.1). |
-| GUFI | printed command | **Run it** (§6.2), per batch, in a work directory removed afterwards. |
+| GUFI | printed command | **Not here.** The suspect file goes to `<work>/batch-<N>/suspects` for `beegfs index update` (§11.4). |
 | Progress | acks to Watch | **Replace** with the last-segment state file (§4). |
-| Retention | none | **Delete** each segment once its batch's rescan succeeded (§4). |
+| Retention | none | With `--markwalk.retain`, delete sealed segments ≤ the state after each batch, keeping the newest (`reader.go` `retain`). |
 
 Reader loop (shape):
 
 ```
-done := readState(statePath)                        // last segment number whose rescan succeeded
-deleteSegments(spool, <= done)                      // a crash between state write and delete
+done := readState(statePath)                        // last segment whose suspect file is written
 for {
-    segs := sealedSegments(spool, > done)           // by number; never *.partial
-    if len(segs) == 0 { sleep(poll); continue }
-
-    b := newBatch()
-    for _, seg := range segs {                      // cut at -every, or -max-segments
-        r := spool.NewReader(open(seg))
-        for ev, err := r.Next(); err == nil; ev, err = r.Next() {
-            noteSeq(ev.GetMetaId(), ev.GetSeqId())  // gaps: log and count only (§7)
-            if v2 := ev.GetV2(); v2 != nil {
-                b.add(dirsFor(v2, mount, trackOpens))
-            }
-        }
-        b.last = seg.number
-        if b.full() { break }
+    segs := sealedSegments(spool, > done)[:maxSegments]   // by number; never *.partial
+    if len(segs) > 0 {
+        if process(segs) != nil {                   // damaged segment, write error, panic
+            sleep(backoff); continue                // retry; nothing is skipped
+        }                                           // process: noteSeq (§7), dirsFor, suspect file,
+        done = last(segs)                           // then state (renameio + fsync of the directory)
+        if --markwalk.retain { deleteSegments(spool, <= done, keep newest) }
+        if len(segs) == maxSegments { continue }    // behind: straight on to the next batch
     }
-
-    if b.empty() || runGUFI(b) == nil {             // §6.2: suspects, run, clean up
-        write state(statePath, b.last)              // renameio + fsync of the directory
-        deleteSegments(spool, <= b.last)
-        done = b.last
-    }                                               // on failure: keep everything, retry later
+    wait for the collector's nudge (--mode both) or poll (--mode process)
+    sleep until last batch + every                  // steady load: one batch per --markwalk.every
 }
 ```
 
@@ -107,7 +98,7 @@ for {
 - **Order:** ascending segment number; records in file order. Suspect-file correctness does not
   depend on it (a set has no order, §8), but it keeps progress a single number.
 - **Only sealed segments.** Never open a `*.partial`.
-- **Progress** (`-state`): the highest segment number whose batch's rescan succeeded, written
+- **Progress** (`--markwalk.state`): the highest segment number whose batch's rescan succeeded, written
   atomically (temp file, fsync, rename). On restart, resume after it.
 - **Reprocess-safe.** A crash after the rescan but before the state write reprocesses those
   segments: the same directories are marked again, and `gufi_incremental_update` "accepts the
@@ -145,7 +136,7 @@ live in its own `db.db` — and otherwise rises to the parent, where a file's ar
 | 10 | `UNLINK` | parent | `num_links ≥ 1` | the other names' link count dropped |
 | 11 | `HARDLINK` | both parents (new link's and target's) | `num_links > 1` | path = new link, target = existing |
 | 12 | `RENAME` | common ancestor + both parents | — | path = old, target = new; one event |
-| 13–15 | `OPEN_*` | as FLUSH, only with `-track-opens` | `num_links > 1` | atime only; high volume |
+| 13–15 | `OPEN_*` | as FLUSH, only with `--markwalk.track-opens` | `num_links > 1` | atime only; high volume |
 | 16 | `LAST_WRITER_CLOSED` | as FLUSH | `num_links > 1` | |
 | 17 | `OPEN_BLOCKED` | nothing | — | the open was refused |
 | 18 | `STRIPE_PATTERN_CHANGED` | as FLUSH | `num_links > 1` | |
@@ -206,7 +197,7 @@ What the update does by itself, with no help from the suspect file:
 What still needs the suspect file: a directory whose **contents** changed while the directory itself
 stayed where it was. That is markwalk's job.
 
-- `<run>` is a fresh directory under `-work` for this batch; the parking lot holds moved
+- `<run>` is a fresh directory under `--markwalk.work` for this batch; the parking lot holds moved
   directories and new db.dbs. After a successful run markwalk removes `<run>` entirely. After a
   failed run it keeps the newest few for diagnosis and removes older ones.
 - Run it with `<run>` as the working directory. It makes a temporary database in its working
@@ -238,7 +229,7 @@ carried forward as `e2f5d4a7`.
 
 Mode 1 still walks the whole source tree to find the suspect inodes and diffs it against the
 index, so a run costs time proportional to the file system, not to the batch. Run it
-minutes apart, not seconds: `-every` sets how long a batch collects before its run. Events keep
+minutes apart, not seconds: `--markwalk.every` sets how long a batch collects before its run. Events keep
 arriving in segments meanwhile; nothing waits.
 
 ---
@@ -274,25 +265,25 @@ So a batch may span any number of segments and metas: many segments → one susp
 
 ## 9. Flags / CLI
 
-Status: **done** is in `main.go`/`reader.go`; **consumer** belongs to whatever runs the update (§6), not markwalk.
+Status: **done** is in `markwalk.go`/`reader.go`; **consumer** belongs to whatever runs the update (§6), not markwalk.
+All flags belong to `cmd/beegfs-index-sync`, which also takes the collector's.
 
 | flag | status | purpose |
 |---|---|---|
 | `-listen`, `-out` | removed | no longer a gRPC server; the suspect file lives in the batch directory |
-| `-spool` | done | the collector's segment directory |
-| `-state` | done | the last segment whose batch is done, and each meta's highest sequence ID |
-| `-work` | done | one directory per batch, `batch-<last segment>/suspects`; the consumer removes it once applied |
-| `-every` | done, new meaning | how long a batch collects before it is made (default 1m; minutes in production) |
-| `-poll` | done | how often to look again when there are no new segments (default 5s) |
-| `-max-segments` | done | most segments in one batch (default 100) |
-| `-once` | done | process the segments there now and exit (tests, cron) |
-| `-mount`,`-index`,`-query`,`-track-opens`,`-demo` | kept | unchanged |
+| `--mode` | done | `both` (default), `collect` or `process`; `process` runs markwalk alone against a shared spool |
+| `--spool` | done | the collector's segment directory |
+| `--markwalk.state` | done | the last segment whose batch is done, and each meta's highest sequence ID |
+| `--markwalk.work` | done | one directory per batch, `batch-<last segment>/suspects`; the consumer removes it once applied |
+| `--markwalk.every` | done, new meaning | how long a batch collects before it is made (default 1m; minutes in production) |
+| `--markwalk.poll` | done | in `--mode process`, how often to look for new segments (default 30s); in `--mode both` the collector's seal nudges markwalk instead |
+| `--markwalk.retain` | done | delete sealed segments ≤ the state after each batch, keeping the newest (off by default) |
+| `--markwalk.max-segments` | done | most segments in one batch (default 100) |
+| `--markwalk.once` | done | with `--mode process`: process the segments there now and exit (tests, cron) |
+| `--markwalk.mount`,`--markwalk.index`,`--markwalk.query`,`--markwalk.track-opens` | kept | unchanged |
 | `-gufi`, `-threads` | consumer | `gufi_incremental_update` binary and its `-n` |
 | `-plugin` | consumer | `beegfs_index_ops:<lib>` (§6.2) |
-| `-keep-segments` | consumer | do not delete processed segments (test clusters) |
 | `-dry-run` | consumer | write the suspect file and print the command; never run it, never move progress |
-
-`-demo` (`demo.go`) prints what `markChain` marks for five awkward trees.
 
 ---
 
@@ -317,23 +308,29 @@ Status: **done** is in `main.go`/`reader.go`; **consumer** belongs to whatever r
 1. Done: the collector names segments `seg-<N>.binpb` and continues numbering after a restart;
    `dirsFor`/`linkedEntryID` handle INVALID, inode changes on directories and the root, and UNLINK.
 2. Done: the reader (`reader.go`). The `spool` package gained `SegmentNumber` and `Sealed`, the
-   numbered listing every reader shares. A batch of up to `-max-segments` sealed segments becomes
+   numbered listing every reader shares. A batch of up to `--markwalk.max-segments` sealed segments becomes
    `<work>/batch-<last>/suspects`, written atomically, and only then is the state file (also atomic)
    moved past it. A damaged segment stops markwalk with its state unchanged.
 3. Done: `ReceiveEvents`, `net.Listen`, `grpc.NewServer`, `-listen` and `-out` are gone.
 4. Out of scope for markwalk: the run (§6.2) lives in the consumer of the suspect files. markwalk's
    state moves after the suspect file is written, so the consumer must apply batches in order and
    track its own progress.
-5. Retention: segments ≤ the state can be deleted once the consumer has applied their batch; the
-   consumer owns this, not markwalk.
+5. Retention: done, opt-in with `--markwalk.retain`. markwalk deletes sealed segments ≤ its state after each
+   batch and keeps the newest, so the collector's numbering continues; the collector also persists
+   its counter. Without `--markwalk.retain` the consumer decides when segments go.
 6. Gap logging (§7): done, per meta, carried across restarts in the state file. Counters are later.
 7. beegfs-index: done, rebased onto upstream GUFI (§6.2, §6.3); the consumer passes `beegfs_index_ops`
    with `--plugin`.
 8. Update `README.md` and `FLOW.md` (the picture becomes `collector → segments → markwalk → GUFI`;
    gap #1 is closed by §4).
 9. Tests: done for the reader (`reader_test.go`: batches, many segments to one batch, `.partial`
-   left alone, holes across runs, a damaged segment, an empty batch). Still to add: a golden
-   segment covering every enum value, and a crash test for the consumer.
+   left alone, holes across runs, a damaged segment, an empty batch; `run_test.go`: one batch per
+   `--markwalk.every` under steady seals, draining a backlog, retrying a failed batch, retention, a recovered
+   panic). Still to add: a golden segment covering every enum value, and a crash test for the consumer.
+10. Done: merged with the collector into `cmd/beegfs-index-sync` (`../../MERGE-DESIGN.md`).
+    `markwalk.Run` is a goroutine of that binary: in `--mode both` a seal nudges it instead of a
+    poll, a failed batch is retried with backoff and a panic in one batch is recovered, so the
+    collector sharing the process never stops for it. Logging moved from `slog` to zap.
 
 ---
 

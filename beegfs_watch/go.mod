@@ -3,11 +3,13 @@ module github.com/thinkparq/beegfs-index/beegfs_watch
 go 1.26.4
 
 require (
+	github.com/cenkalti/backoff/v5 v5.0.3
 	github.com/google/renameio/v2 v2.0.2
 	github.com/hashicorp/golang-lru/v2 v2.0.7
 	github.com/thinkparq/beegfs-go v0.8.4
 	github.com/thinkparq/protobuf v0.8.5-0.20260901112913-25d79b6293ee
 	go.uber.org/zap v1.27.1
+	golang.org/x/sync v0.24.0
 	google.golang.org/protobuf v1.36.11
 )
 

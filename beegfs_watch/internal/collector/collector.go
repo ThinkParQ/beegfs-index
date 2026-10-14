@@ -1,17 +1,17 @@
-// Command collector receives events from one or more BeeGFS Watch instances and
-// writes them to spool files for the processor to pick up.
+// Package collector receives events from one or more BeeGFS Watch instances and
+// writes them to spool files for markwalk to pick up.
 //
 // Events are appended, exactly as Watch sent them, to seg-<N>.binpb.partial:
 // protobuf binary, each record prefixed with its length (protodelim). The spool
-// package reads them. When a file holds enough
-// events, or has been open long enough, it is handed to a sealer, which fsyncs
-// it, gives it its final seg-<N>.binpb name, fsyncs the directory, and only then
-// acks its events back to Watch. A sealed file is therefore complete and on
-// disk, and is the processor's to take.
+// package reads them. When a file holds enough events, or has been open long
+// enough, it is handed to a sealer, which fsyncs it, gives it its final
+// seg-<N>.binpb name, fsyncs the directory, and only then acks its events back
+// to Watch. A sealed file is therefore complete and on disk, and is markwalk's
+// to take.
 //
 // N counts up from 1, zero-padded, and continues from the highest sealed file
-// after a restart, so name order is number order is arrival order. A reader
-// can keep its place as a single number.
+// after a restart, or from the persisted counter when that is higher, so name
+// order is number order is arrival order even after old files are removed.
 //
 // Nothing here can slow down the file system: the metadata service and Watch
 // never wait for us. What falling behind costs is Watch's buffer, which drops
@@ -23,28 +23,27 @@
 // the metadata service discarded events while Watch was away. Sequence IDs are
 // per meta and count up by one, so the receive loop logs every jump as
 // "missing events", from the first event after a restart on (it starts from the
-// checkpoint).
-// Any .partial left behind is incomplete and is deleted at startup. A
-// disk error stops the collector instead of guessing: nothing unsealed is acked,
-// and the replay after a restart fills the hole.
-package main
+// checkpoint). Any .partial left behind is incomplete and is deleted at
+// startup. A disk error stops the collector instead of guessing: nothing
+// unsealed is acked, and the replay after a restart fills the hole.
+package collector
 
 import (
 	"bufio"
 	"context"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
-	"flag"
 	"fmt"
 	"io/fs"
 	"math"
 	"os"
-	"os/signal"
 	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
 
+	"github.com/google/renameio/v2"
 	"github.com/thinkparq/beegfs-go/watch/pkg/subscriber"
 	"github.com/thinkparq/beegfs-index/beegfs_watch/spool"
 	bw "github.com/thinkparq/protobuf/go/beewatch"
@@ -52,6 +51,126 @@ import (
 	"google.golang.org/protobuf/encoding/protowire"
 	"google.golang.org/protobuf/proto"
 )
+
+// Config holds the collector's configuration.
+type Config struct {
+	// Spool is the directory segment files are written to.
+	Spool string
+	// Listen is the local network address (host:port) Watch connects to.
+	Listen string
+	// Checkpoint is the file where the subscriber SDK records acknowledged sequence IDs.
+	Checkpoint string
+	// Counter is the file recording the highest sealed segment number, so numbering continues
+	// after segments are removed. Empty keeps no counter.
+	Counter string
+	// AckFrequency controls how often acknowledged sequence IDs are sent to Watch and written to
+	// the checkpoint.
+	AckFrequency time.Duration
+	// RollEvery seals the open segment at least this often.
+	RollEvery time.Duration
+	// RollEvents seals the open segment once it holds this many events.
+	RollEvents int
+	// Queue is the number of events buffered between the gRPC streams and the segment writer.
+	Queue int
+	// SealQueue is the number of written segments that may wait for fsync before receiving blocks.
+	SealQueue int
+	// TLSDisable disables TLS for the subscriber gRPC server. Not recommended for production use.
+	TLSDisable bool
+}
+
+// Run serves Watch until ctx is done, then stops cleanly: nothing new is
+// accepted, every file is sealed, and the checkpoint records what was acked.
+// After each seal it does a non-blocking send on sealed, when that is not nil.
+// A disk error returns at once: nothing unsealed was acked, so Watch replays
+// it after a restart.
+func Run(ctx context.Context, cfg Config, log *zap.Logger, sealed chan<- struct{}) error {
+	c := &collector{
+		log: log, dir: cfg.Spool, counter: cfg.Counter, maxEvents: cfg.RollEvents, sealed: sealed,
+		events: make(chan *bw.Event, cfg.Queue),
+		acks:   make(chan subscriber.Ack, 1<<16),
+		sealq:  make(chan *file, cfg.SealQueue),
+		w:      bufio.NewWriterSize(nil, 1<<20),
+	}
+	if err := c.prepare(); err != nil {
+		return fmt.Errorf("unable to prepare spool: %w", err)
+	}
+	store, err := subscriber.NewDiskStore(cfg.Checkpoint)
+	if err != nil {
+		return fmt.Errorf("unable to open checkpoint: %w", err)
+	}
+	stored, err := store.Retrieve()
+	if err != nil {
+		return fmt.Errorf("unable to read checkpoint: %w", err)
+	}
+	c.seqs = newSeqTracker(stored)
+	server, err := subscriber.NewServer(log, subscriber.Config{
+		Address: cfg.Listen, TlsDisable: cfg.TLSDisable, AckFrequency: cfg.AckFrequency,
+	}, store)
+	if err != nil {
+		return fmt.Errorf("unable to create subscriber server: %w", err)
+	}
+
+	loopCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	high := map[uint32]uint64{}
+	written, sealedAll := make(chan error, 1), make(chan error, 1)
+	go func() { written <- c.run(loopCtx, cfg.RollEvery) }()
+	go func() { sealedAll <- c.sealer(high) }()
+	errs := make(chan error, 1)
+	go server.ListenAndServe(c.events, c.acks, errs)
+	log.Info("collector started", zap.String("listen", cfg.Listen), zap.String("spool", cfg.Spool),
+		zap.Int("roll-events", cfg.RollEvents), zap.Duration("roll-every", cfg.RollEvery))
+
+	var serverErr error
+	select {
+	case serverErr = <-errs:
+		log.Error("subscriber server failed", zap.Error(serverErr))
+	case err := <-written:
+		return describe("write failed", err)
+	case err := <-sealedAll:
+		return describe("seal failed", err)
+	case <-ctx.Done():
+	}
+
+	// Stop the source first so nothing new arrives, let the loop drain, then
+	// let the sealer finish every file before acks close for the final flush.
+	server.Stop()
+	cancel()
+	if err := <-written; err != nil {
+		return describe("write failed", err)
+	}
+	if err := <-sealedAll; err != nil {
+		return describe("seal failed", err)
+	}
+	// The SDK records watermarks in the checkpoint from its per-stream
+	// goroutines, which Stop has already ended, so the last files' acks would
+	// never reach it and would replay after a restart. Everything received has
+	// now been sealed, so each meta's highest acked ID is safe to record. Only
+	// raise an entry, or replace the SDK's "seek to end" placeholder (MaxUint64)
+	// for a meta it had not checkpointed yet.
+	if stored, err := store.Retrieve(); err == nil {
+		for meta, seq := range high {
+			if old, ok := stored[meta]; !ok || old == math.MaxUint64 || seq > old {
+				store.Store(meta, seq)
+			}
+		}
+	}
+	close(c.acks)
+	server.WaitFlushed()
+	log.Info("collector stopped")
+	return serverErr
+}
+
+// describe names the two disk errors an operator can act on.
+func describe(what string, err error) error {
+	switch {
+	case errors.Is(err, syscall.ENOSPC):
+		return fmt.Errorf("%s: spool disk is full; events stay in Watch until it has room: %w", what, err)
+	case errors.Is(err, fs.ErrExist):
+		return fmt.Errorf("%s: a sealed file already has this name; refusing to replace it: %w", what, err)
+	}
+	return fmt.Errorf("%s: %w", what, err)
+}
 
 // seqTracker finds holes in each meta's sequence IDs. Only the receive loop
 // uses it.
@@ -62,8 +181,8 @@ type seqTracker struct {
 
 // newSeqTracker starts from the checkpoint, where Watch resumes, so a hole that
 // opened while the collector was down is found on the first event after it.
-// The checkpoint trails the spool by up to -checkpoint-every, so the first hole
-// after a crash can include a few events that were sealed just before it.
+// The checkpoint trails the spool by up to AckEvery, so the first hole after a
+// crash can include a few events that were sealed just before it.
 //
 // A meta that is not in the checkpoint, or only as the SDK's "seek to end"
 // placeholder (MaxUint64), starts at its first event.
@@ -90,21 +209,29 @@ func (t *seqTracker) see(meta uint32, seq uint64) uint64 {
 // file is one spool file and the acks owed for what is in it.
 //
 // acks holds one entry per event (16 B), because the SDK takes acks one event at
-// a time and keeps its own 16 B per unacked event as well. Up to seal-queue + 2
+// a time and keeps its own 16 B per unacked event as well. Up to SealQueue + 2
 // files are in flight (the open one, the queue, the one being sealed), so
-// roll-events bounds that memory, and also how much of Watch's buffer sits
+// RollEvents bounds that memory, and also how much of Watch's buffer sits
 // unacked. Once the SDK can ack a whole prefix (DESIGN.md D8, AckUpTo), this
 // becomes each meta's highest SeqId per file.
 type file struct {
 	f    *os.File
+	n    uint64
 	name string
 	acks []subscriber.Ack
+}
+
+// counter is what the Counter file holds: the highest segment number sealed.
+type counter struct {
+	Segment uint64 `json:"segment"`
 }
 
 type collector struct {
 	log       *zap.Logger
 	dir       string
+	counter   string
 	maxEvents int
+	sealed    chan<- struct{} // nudged after each seal; nil when nobody listens
 
 	events chan *bw.Event
 	acks   chan subscriber.Ack
@@ -120,7 +247,7 @@ type collector struct {
 }
 
 // prepare creates the spool directory, removes any file left mid-write, and
-// continues numbering after the highest sealed file.
+// continues numbering after the highest sealed file or the persisted counter.
 func (c *collector) prepare() error {
 	if err := os.MkdirAll(c.dir, 0o755); err != nil {
 		return err
@@ -143,6 +270,24 @@ func (c *collector) prepare() error {
 			return err
 		}
 	}
+	if c.counter == "" {
+		return nil
+	}
+	if err := os.MkdirAll(filepath.Dir(c.counter), 0o755); err != nil {
+		return err
+	}
+	data, err := os.ReadFile(c.counter)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	var saved counter
+	if err := json.Unmarshal(data, &saved); err != nil {
+		return fmt.Errorf("%s: %w", c.counter, err)
+	}
+	c.last = max(c.last, saved.Segment)
 	return nil
 }
 
@@ -162,7 +307,7 @@ func (c *collector) add(ev *bw.Event) error {
 		if err != nil {
 			return err
 		}
-		c.cur = &file{f: f, name: name, acks: make([]subscriber.Ack, 0, min(c.maxEvents, 1<<16))}
+		c.cur = &file{f: f, n: c.last, name: name, acks: make([]subscriber.Ack, 0, min(c.maxEvents, 1<<16))}
 		c.w.Reset(f)
 	}
 	// Every event has to be acked exactly once or its meta's watermark stops
@@ -210,9 +355,10 @@ func (c *collector) rotate() error {
 }
 
 // seal makes one file durable and then acks it: fsync the data, link it to its
-// final name, fsync the directory so the name survives a power cut, and only
-// then ack. Any other order can ack an event that is not on disk. It returns
-// the per-meta highest sequence ID it acked.
+// final name, fsync the directory so the name survives a power cut, record the
+// number, and only then ack. Any other order can ack an event that is not on
+// disk. It records the per-meta highest sequence ID it acked in high, and then
+// nudges whoever waits for sealed files, without ever waiting for them.
 func (c *collector) seal(fl *file, dir *os.File, high map[uint32]uint64) error {
 	if err := fl.f.Sync(); err != nil {
 		return fmt.Errorf("fsync %s: %w", fl.name, err)
@@ -232,12 +378,24 @@ func (c *collector) seal(fl *file, dir *os.File, high map[uint32]uint64) error {
 	if err := dir.Sync(); err != nil {
 		return fmt.Errorf("fsync spool directory: %w", err)
 	}
+	if c.counter != "" {
+		data, _ := json.Marshal(counter{fl.n})
+		if err := renameio.WriteFile(c.counter, data, 0o644, renameio.WithTempDir(filepath.Dir(c.counter))); err != nil {
+			return fmt.Errorf("record segment counter: %w", err)
+		}
+	}
 	// One send per event until the SDK has AckUpTo (DESIGN.md D8); see file.
 	for _, a := range fl.acks {
 		c.acks <- a
 		high[a.MetaId] = max(high[a.MetaId], a.SeqId)
 	}
 	c.log.Info("sealed", zap.String("file", fl.name), zap.Int("events", len(fl.acks)))
+	if c.sealed != nil {
+		select {
+		case c.sealed <- struct{}{}:
+		default: // one pending nudge covers any number of seals
+		}
+	}
 	return nil
 }
 
@@ -288,129 +446,4 @@ func (c *collector) run(ctx context.Context, every time.Duration) error {
 			}
 		}
 	}
-}
-
-func main() {
-	listen := flag.String("listen", "0.0.0.0:50052", "address Watch dials into")
-	dir := flag.String("spool", "/var/lib/index-sync/spool", "spool directory for "+spool.Ext+" files")
-	ckpt := flag.String("checkpoint", "/var/lib/index-sync/checkpoint.json", "acked sequence IDs")
-	ackEvery := flag.Duration("checkpoint-every", time.Second, "how often acks reach Watch and disk; Watch frees buffer space only then")
-	rollEvery := flag.Duration("roll-every", 30*time.Second, "seal the open file at least this often")
-	// Every event in flight is unacked in Watch too, and Watch overwrites the
-	// oldest unacked events once a meta's event-buffer-size fills. Sent but
-	// unsealed events are then gone if the collector crashes. So keep
-	// (seal-queue + 2) * roll-events well under event-buffer-size.
-	rollEvents := flag.Int("roll-events", 100_000,
-		"seal the open file once it holds this many events; (seal-queue + 2) times this is the most "+
-			"held unacked, at 32 B each here and in the SDK, and must stay well under Watch's event-buffer-size")
-	queue := flag.Int("queue", 65536, "events held between the gRPC streams and the writer")
-	sealQueue := flag.Int("seal-queue", 4, "written files that may wait for fsync before receiving waits")
-	noTLS := flag.Bool("tls-disable", true, "disable TLS, not for production")
-	flag.Parse()
-
-	log, _ := zap.NewProduction()
-	defer log.Sync()
-
-	// Watch frees buffer space only for what we have acked, and we ack only at
-	// seal, so these bound how far behind Watch's buffer can get.
-	if *rollEvents < 1 || *queue < 1 || *sealQueue < 1 || *rollEvery <= 0 {
-		log.Fatal("roll-events, queue and seal-queue must be at least 1, roll-every above 0")
-	}
-
-	c := &collector{
-		log:       log,
-		dir:       *dir,
-		maxEvents: *rollEvents,
-		events:    make(chan *bw.Event, *queue),
-		acks:      make(chan subscriber.Ack, 1<<16),
-		sealq:     make(chan *file, *sealQueue),
-		w:         bufio.NewWriterSize(nil, 1<<20),
-	}
-	if err := c.prepare(); err != nil {
-		log.Fatal("could not prepare spool", zap.Error(err))
-	}
-
-	store, err := subscriber.NewDiskStore(*ckpt)
-	if err != nil {
-		log.Fatal("could not open checkpoint", zap.Error(err))
-	}
-	stored, err := store.Retrieve()
-	if err != nil {
-		log.Fatal("could not read checkpoint", zap.Error(err))
-	}
-	c.seqs = newSeqTracker(stored)
-	server, err := subscriber.NewServer(log, subscriber.Config{
-		Address:      *listen,
-		TlsDisable:   *noTLS,
-		AckFrequency: *ackEvery,
-	}, store)
-	if err != nil {
-		log.Fatal("could not create server", zap.Error(err))
-	}
-
-	// A disk error ends the process. Carrying on would mean acking around a
-	// file that never reached disk; exiting leaves those events unacked, so
-	// they come back when the collector does.
-	fatal := func(what string, err error) {
-		if errors.Is(err, syscall.ENOSPC) {
-			log.Fatal(what+": spool disk is full; events stay in Watch until it has room", zap.Error(err))
-		}
-		if errors.Is(err, fs.ErrExist) {
-			log.Fatal(what+": a sealed file already has this name; refusing to replace it", zap.Error(err))
-		}
-		log.Fatal(what, zap.Error(err))
-	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	high := map[uint32]uint64{}
-	received := make(chan struct{})
-	sealed := make(chan struct{})
-	go func() {
-		if err := c.run(ctx, *rollEvery); err != nil {
-			fatal("write failed", err)
-		}
-		close(received)
-	}()
-	go func() {
-		if err := c.sealer(high); err != nil {
-			fatal("seal failed", err)
-		}
-		close(sealed)
-	}()
-
-	errs := make(chan error, 1)
-	go server.ListenAndServe(c.events, c.acks, errs)
-	log.Info("collector started", zap.String("listen", *listen), zap.String("spool", *dir),
-		zap.Int("roll-events", *rollEvents), zap.Duration("roll-every", *rollEvery))
-
-	sig := make(chan os.Signal, 1)
-	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
-	select {
-	case err := <-errs:
-		log.Error("subscriber server failed", zap.Error(err))
-	case <-sig:
-	}
-
-	// Stop the source first so nothing new arrives, let the loop drain, then
-	// let the sealer finish every file before acks close for the final flush.
-	server.Stop()
-	cancel()
-	<-received
-	<-sealed
-	// The SDK records watermarks in the checkpoint from its per-stream
-	// goroutines, which Stop has already ended, so the last files' acks would
-	// never reach it and would replay after a restart. Everything received has
-	// now been sealed, so each meta's highest acked ID is safe to record. Only
-	// raise an entry, or replace the SDK's "seek to end" placeholder (MaxUint64)
-	// for a meta it had not checkpointed yet.
-	if stored, err := store.Retrieve(); err == nil {
-		for meta, seq := range high {
-			if old, ok := stored[meta]; !ok || old == math.MaxUint64 || seq > old {
-				store.Store(meta, seq)
-			}
-		}
-	}
-	close(c.acks)
-	server.WaitFlushed()
-	log.Info("collector stopped")
 }

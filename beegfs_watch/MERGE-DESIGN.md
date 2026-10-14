@@ -3,7 +3,7 @@
 
 Merge into **one binary with two independent goroutine groups**, but **keep the disk spool as the
 data handoff between them — do not pass event data over an in-memory channel.** A channel is used
-only for a zero-payload "a segment was sealed" wakeup. Add a `-mode both|collect|process` flag so
+only for a zero-payload "a segment was sealed" wakeup. Add a `--mode both|collect|process` flag so
 the single binary can still run the two roles on separate hosts.
 
 The merge is about process/lifecycle unification and operational simplicity, **not** about changing
@@ -39,7 +39,7 @@ Cadence/failure models differ sharply:
 
 | | collector | markwalk |
 |---|---|---|
-| cadence | real-time, 100k–1M events/s | periodic (default `-every 1m`, up to `-max-segments 100` = up to ~10M events/batch) |
+| cadence | real-time, 100k–1M events/s | periodic (default `--markwalk.every 1m`, up to `--markwalk.max-segments 100` = up to ~10M events/batch) |
 | work | receive → encode → fsync → **ack Watch** | stat-walks + `gufi_query` subprocesses + build suspect file |
 | crash recovery | replay from Watch | repeat batch from durable spool + state file |
 | failure cost | Watch ring buffer **drops events** if acks stall | just redo the batch |
@@ -94,7 +94,7 @@ the spool directory — not an in-memory pipeline.
 
 Operational wins:
 - one binary / systemd unit / config / log stream / metrics endpoint to deploy and monitor;
-- a natural owner for segment retention (and, optionally, for running `gufi_incremental_update`);
+- a natural owner for segment retention;
 - an in-process wakeup so markwalk reacts to new segments without poll latency.
 
 The single real risk is **loss of the OS process boundary** that today gives free fault isolation.
@@ -106,7 +106,7 @@ collector — that would make Watch drop events. This is engineered, not free (s
 ## 4. Target architecture
 
 ```
-                         one process (beegfs-watch)
+                         one process (beegfs-index-sync)
    Watch (gRPC) ──► [collector goroutines] ──► seg-<N>.binpb ──► [markwalk goroutine] ──► suspect files
                          receive/seal/ack        spool dir            read/mark/retire
                                 │                                          ▲
@@ -115,17 +115,32 @@ collector — that would make Watch drop events. This is engineered, not free (s
 
 - Data path between stages is **always the spool files**.
 - `sealed chan struct{}` carries only "something new is sealed", never event data.
-- `-mode`:
+- `--mode`:
   - `both` (default): collector + markwalk in one process, shared spool, nudge enabled.
   - `collect`: collector only (e.g., Watch/metadata host).
   - `process`: markwalk only (e.g., index host, reading a shared/synced spool); nudge absent, polls.
+
+The binary is named `beegfs-index-sync`, matching the existing `/var/lib/index-sync/` defaults.
+`beegfs-watch` is taken: it is the BeeGFS Watch daemon in beegfs-go (`watch/cmd/beegfs-watch`).
+
+Split mode is kept because it is cheap, not because the remote-index case needs it. markwalk needs
+the BeeGFS mount and the index on the same host, and Watch dials into the collector, so running
+`both` on the index host is the simpler deployment. When the spool is shared instead, the seal
+(`link` → `unlink` → directory `fsync`) relies on the shared filesystem: on NFS, directory attribute
+caching can delay when the reader sees a sealed name, and each `fsync` is a round trip. A linked
+file is complete when it appears, so correctness holds, but latency and ENOSPC behaviour change.
+Test the split on the real shared filesystem before relying on it.
 
 ---
 
 ## 5. Fault isolation rules (the main risk of merging)
 
-- markwalk's goroutine runs under **panic recovery**; a panic or batch error is **logged and retried
-  next batch**, never fatal to the process.
+- markwalk's goroutine runs under **panic recovery**; a panic or batch error is logged (a panic
+  with its stack), counted in a metric, and the batch is **retried with exponential backoff**, never
+  fatal to the process and never silently stopped. A stopped markwalk starts the ENOSPC chain in §9,
+  and the same input panics the same way, so recovery must back off rather than loop. `recover`
+  covers only its own goroutine: every worker goroutine markwalk starts (§9.3) needs its own, or an
+  errgroup that turns panics into errors.
 - The collector keeps **fatal-on-disk-error** (that *should* stop everything; unsealed events replay).
 - markwalk shares no mutable state with the collector; its only input is sealed files on disk.
 - A collector fatal propagates to process exit; a markwalk error does not.
@@ -150,9 +165,13 @@ collector — that would make Watch drop events. This is engineered, not free (s
 
 - Add `sealed chan struct{}` (cap 1). After a successful `seal()`, the collector does a non-blocking
   send: `select { case sealed <- struct{}{}: default: }` (coalesces; never blocks the sealer).
-- markwalk waits on `select { <-ctx.Done() ; <-timer(every) ; <-sealed }` instead of only polling,
-  then reads **event data from disk**. Removes up-to-`poll` latency without moving data or coupling
-  cadence. In `collect`/`process` split mode the channel is absent and markwalk polls as today.
+- The nudge means only "work is pending". It must not set the batch cadence: the collector seals
+  every `--collector.roll-every` (30s) or `--collector.roll-events`, so a markwalk that batches on every nudge would make
+  one batch per segment and multiply the `batch-<N>` directories `beegfs index update` has to apply.
+  So markwalk, when caught up, blocks on `select { <-ctx.Done() ; <-sealed }`; once nudged it waits
+  until `--markwalk.every` has passed since its last batch, then reads **event data from disk**. Idle costs
+  nothing, steady load gives one batch per `--markwalk.every`, and a backlog drains per §9.1.
+- In `collect`/`process` split mode the channel is absent and markwalk polls (§10.2).
 
 ---
 
@@ -167,13 +186,21 @@ highest**.
 `max(existing sealed numbers)`. If retention deletes segments and the collector restarts with
 few/none left, the counter could **reset below markwalk's watermark**, and markwalk's
 `Sealed(dir, after=high)` would then **skip** new low-numbered segments.
-**Required fix before enabling retention:** persist the collector's segment counter (e.g., alongside
-the checkpoint) and resume from `max(persisted, max-on-disk)`, so numbering is monotonic independent
-of deletion.
+**Required fix before enabling retention:** persist the collector's segment counter and resume from
+`max(persisted, max-on-disk)`, so numbering is monotonic independent of deletion. This also covers an
+operator wiping the spool by hand. The SDK owns `checkpoint.json`, so the counter gets its own file
+next to `markwalk.json`; the service then has three state files, each with one owner.
 
-Optional (DESIGN.md open question, behind a flag): the merged service also runs
-`gufi_incremental_update` per batch and retires segments only after the rescan runs — tightening the
-"don't advance the index until the rescan ran" gap. Additive; not required for the merge.
+Rules:
+- Retention runs on the markwalk side only. It knows the committed segment and can read the
+  directory for the highest one; `collect` mode knows neither and never deletes.
+- Never delete `.partial` files, and always keep at least one sealed segment.
+- Retention keys on markwalk's commit, not on the index. Once a batch's suspect file is durable, its
+  segments are no longer needed.
+
+The service does **not** run `gufi_incremental_update`. Applying suspect files is the job of
+`beegfs index update` in the CTL; a second consumer here would mean two checkpoints and a race on the
+parking lot.
 
 ---
 
@@ -194,25 +221,28 @@ markwalk can't keep up → segments pile up → spool disk fills → collector h
 
 So the goal is to keep the backlog bounded so the disk never fills.
 
-### 9.1 Greedy drain — make `-every` a max-idle time, not a throttle (primary fix)
+### 9.1 Greedy drain — make `--markwalk.every` a max-idle time, not a throttle (primary fix)
 
-Today markwalk waits `-every` (default 1 min) **between every batch unconditionally**
-(`reader.go` `run()`: process, then `time.After(every)`), and caps a batch at `-max-segments` (100).
+Today markwalk waits `--markwalk.every` (default 1 min) **between every batch unconditionally**
+(`reader.go` `run()`: process, then `time.After(every)`), and caps a batch at `--markwalk.max-segments` (100).
 If the collector produces more than `max-segments` per `every`, markwalk falls behind **forever** —
 exactly the "collector generates lots of files, markwalk runs infrequently" case.
 
 Change the loop so it self-throttles:
 - If the last pass hit the `max-segments` cap (more segments were waiting), **loop again
-  immediately**, no `-every` wait, until the backlog is drained.
-- Only wait `-every` (or the seal-nudge, §7) when **caught up** (fewer than a batch waiting).
+  immediately**, no `--markwalk.every` wait, until the backlog is drained.
+- Only wait `--markwalk.every` (or the seal-nudge, §7) when **caught up** (fewer than a batch waiting).
 
 ```
-caught up → wait (every OR seal-nudge)
 behind    → process next batch immediately, repeat until drained
+caught up → block on the seal-nudge (split mode: poll)
+nudged    → wait until --markwalk.every has passed since the last batch, then process
 ```
 
-`-every` becomes "maximum staleness when idle," not a hard throttle. This is the single most
-important change for backlog control.
+`--markwalk.every` becomes the minimum spacing between batches under steady load, not a throttle on a
+backlog. This is the single most important change for backlog control. Pick its default with the
+consumer in mind: `beegfs index update` runs one `gufi_incremental_update` per batch directory, so a
+1-minute `--markwalk.every` means up to 1,440 runs a day.
 
 ### 9.2 Bigger catch-up batches are cheaper, not more expensive
 
@@ -220,13 +250,19 @@ Suspect files are a **set of directories** (dedup by inode), so a large batch of
 to a small set of dirty directories: 10 vs 1000 segments over the same tree yield nearly the same
 suspect file and one `gufi_incremental_update`. When behind, process **large** batches — per-batch
 overhead (sibling query, suspect write, rescan) is amortized over far more events, and dedup
-coalescing does the catching up. Raise `-max-segments` (or auto-size it up when the backlog is
-large); do not keep it small.
+coalescing does the catching up. Raise `--markwalk.max-segments` (or auto-size it up when the backlog is
+large); do not keep it small. Larger batches do cost memory in markwalk: the per-batch directory set
+and the `links` set of multi-name entry IDs (`reader.go`) grow with the batch, and sibling lookups
+run one `gufi_query` per ~3,500 IDs. Auto-sizing therefore needs a cap, by events or bytes, not just
+"larger when behind".
 
 ### 9.3 Scale markwalk throughput to match production
 
 markwalk is mostly IO-bound (stat-walks + `gufi_query` subprocesses), so it can be sped up:
-parallelize the stat walks and sibling queries within a batch, and keep batches large (§9.2). If,
+parallelize the stat walks and sibling queries within a batch, and keep batches large (§9.2). The
+stat cache is `simplelru.LRU` (`markwalk/main.go`), the lock-free variant; before `markChain` runs in
+parallel, switch to the locking `lru.Cache` from the same module or give each worker its own cache.
+Each worker also needs its own panic recovery (§5). If,
 after greedy drain + large batches + parallelism, markwalk still cannot match the sustained event
 rate, that is a **provisioning signal** (markwalk/index host too slow for the change rate) — not
 something to fix by throttling the collector.
@@ -282,9 +318,9 @@ spin. Event-driven waits, not short fixed-interval loops.
 
 The receive loop (`collector/main.go` `run()`) is a blocking `select` on `c.events`, the roll
 ticker, and `ctx.Done()`. With no events it blocks on the network/channel; the only wakeups are:
-- the `-roll-every` ticker (30s): fires `rotate()`, which is a **no-op when no file is open**
+- the `--collector.roll-every` ticker (30s): fires `rotate()`, which is a **no-op when no file is open**
   (`c.cur == nil`) — so idle costs one cheap timer wakeup per 30s;
-- the SDK ack flusher (`-checkpoint-every`, 1s): `Flush()` returns early when nothing changed
+- the SDK ack flusher (`--collector.ack-frequency`, 1s): `Flush()` returns early when nothing changed
   (`needsFlush == false`), so idle costs a cheap 1s timer wakeup with no disk write.
 
 These are bounded timer wakeups, not a spin — no change required. (Optional micro-tidy: only arm the
@@ -292,22 +328,21 @@ roll ticker while a file is open; negligible, not worth it.)
 
 ### 10.2 markwalk when idle — switch from polling to the seal-nudge
 
-Today `markwalk` `run()` re-scans the spool directory every `-poll` (5s) forever, even when the
+Today `markwalk` `run()` re-scans the spool directory every `--markwalk.poll` (5s) forever, even when the
 filesystem is idle for hours: `spool.Sealed()` (an `os.ReadDir` + sort) runs each iteration, then
 `time.After(poll)`. That is a constant periodic wakeup + directory scan with no work to do, and the
 scan is O(files) — worse if the spool is large.
 
 In `both` mode, make markwalk **block on the seal-nudge** instead of polling:
-- When caught up, wait on `select { <-ctx.Done() ; <-sealed ; <-timer(every) }` where `sealed` is the
-  collector's nudge (§7) and `every` is a **long** max-staleness fallback.
-- Idle ⇒ the collector seals nothing ⇒ no nudge ⇒ markwalk sleeps until the (long) fallback timer,
-  which finds nothing and sleeps again. **Zero directory scans while idle** beyond the occasional
-  fallback tick.
+- When caught up, wait on `select { <-ctx.Done() ; <-sealed }`. After a nudge, wait out the rest of
+  `--markwalk.every` since the last batch (§7), then scan. No timer runs while idle.
+- Idle ⇒ the collector seals nothing ⇒ no nudge ⇒ markwalk stays blocked. **Zero directory scans
+  while idle.**
 - The nudge is cap-1 and coalesced; a seal that happens in the gap between "Sealed() returned empty"
   and "block on sealed" is buffered, so the wakeup is never missed, and markwalk always re-scans on
   wake (so one nudge covers any number of new segments).
 - In split-host `process` mode there is no nudge, so markwalk polls — but with a **longer** default
-  `-poll` and reliance on retention (§8) to keep the scanned directory small. Consider exponential
+  `--markwalk.poll` and reliance on retention (§8) to keep the scanned directory small. Consider exponential
   backoff up to a cap when consecutive scans find nothing.
 
 ### 10.3 Greedy drain must not become a busy-loop
@@ -316,14 +351,13 @@ In `both` mode, make markwalk **block on the seal-nudge** instead of polling:
 `max-segments` cap**. When caught up (the idle case) markwalk blocks per §10.2. Guard the greedy loop
 so it re-loops without waiting *only* if `st.Segment` advanced; otherwise fall through to the
 blocking wait. This prevents a hot loop if `process()` ever returns without advancing (e.g., a batch
-that marks nothing still advances `st.Segment`, so it terminates; a repeating error returns and stops
-the goroutine rather than spinning).
+that marks nothing still advances `st.Segment`, so it terminates; a repeating error backs off per §5
+rather than spinning or stopping).
 
-### 10.4 Avoid `time.After` in the hot path
+### 10.4 `time.After` is fine here
 
-Use a single reusable `time.Timer` (reset per wait) rather than `time.After` inside the loop:
-`time.After` allocates a new timer each call, which is wasteful in a greedy-drain loop. Minor, but
-free to get right.
+The module is on Go 1.26; since Go 1.23 an unreferenced `time.After` timer is garbage-collected, and
+this loop runs once per batch. No timer reuse is needed.
 
 Net: idle ⇒ both halves are **blocked on an event or a long timer**, with no periodic directory
 scans (in `both` mode) and no busy-loop. Busy only when there is real work.
@@ -339,23 +373,28 @@ scans (in `both` mode) and no busy-loop. Busy only when there is real work.
      roll bounds, seq tracking, and the SDK shutdown/checkpoint sequence verbatim.
    - `beegfs_watch/internal/markwalk/` — move the `reader` type + `run`/`process`/`dirsFor`/
      `markChain`/`writeSuspects`/`siblingDirs`/`statCache`/`readState`; expose `Run(ctx, cfg, log)
-     error`. Keep `-demo`.
+     error`.
    - `beegfs_watch/spool/` — unchanged (the on-disk contract).
-2. **Unified entrypoint** `beegfs_watch/cmd/beegfs-watch/main.go`: one flag set grouped by role,
-   `-mode both|collect|process`, shared logger/metrics, one signal handler, shutdown coordination
+2. **Unified entrypoint** `beegfs_watch/cmd/beegfs-index-sync/main.go`: one flag set grouped by role,
+   `--mode both|collect|process`, shared logger/metrics, one signal handler, shutdown coordination
    (§6), and the `sealed` nudge wired in `both` mode (§7).
-3. **markwalk wait loop (§9.1 + §10.2–§10.4):** rework `markwalk` `run()` so that, when **behind**, it
-   loops immediately (no `-every` wait) while the last pass advanced state and hit the `max-segments`
-   cap; when **caught up / idle**, it blocks on `select { ctx.Done ; <-sealed ; <-timer(every) }` (the
-   seal-nudge, long fallback) rather than polling the directory. Use one reusable timer, not
-   `time.After`. In `process` split mode (no nudge), poll with a longer `-poll` and back off.
-   Optionally auto-size `max-segments` up under a large backlog (§9.2).
+3. **markwalk wait loop (§7, §9.1, §10.2–§10.3):** rework `markwalk` `run()` so that, when
+   **behind**, it loops immediately (no `--markwalk.every` wait) while the last pass advanced state and hit the
+   `max-segments` cap; when **caught up / idle**, it blocks on the seal-nudge rather than polling the
+   directory, and after a nudge waits out `--markwalk.every` since the last batch. Errors and panics back off
+   per §5. In `process` split mode (no nudge), poll with a longer `--markwalk.poll` and back off. Optionally
+   auto-size `max-segments` up under a large backlog, with a cap (§9.2).
 4. **Retention + counter persistence** (§8), gated on a flag initially.
-5. **Metrics:** one endpoint exposing both collector (events/s, seal latency, unacked depth, seq
-   gaps) and markwalk (batch size, marks, stats, sibling-query time, `spool_segments_pending`,
-   `spool_bytes_pending`, spool free space, retention) — see §9.6.
+5. **Metrics (follow-up PR):** neither program has an endpoint today, so this is new behaviour,
+   not part of the merge. One endpoint exposing both collector (events/s, seal latency, unacked
+   depth, seq gaps) and markwalk (batch size, marks, stats, sibling-query time,
+   `spool_segments_pending`, `spool_bytes_pending`, spool free space, retention, consecutive
+   failures) — see §9.6.
 6. Keep the standalone `collector`/`markwalk` `main` packages only as long as needed for transition,
-   then remove in favor of `-mode`.
+   then remove in favor of `--mode`.
+7. **Docs:** `markwalk/DESIGN.md` and `markwalk/FLOW.md` still describe markwalk running
+   `gufi_incremental_update` and deleting segments, and list flags that do not exist. Update them
+   with the merge.
 
 ---
 
@@ -373,21 +412,23 @@ scans (in `both` mode) and no busy-loop. Busy only when there is real work.
 
 ## 13. Testing & rollout
 
-1. Refactor to packages with **no behavior change** (both still runnable via `-mode`).
-2. Unit tests: wakeup nudge (non-blocking, coalesced); retention + counter-persistence across a
-   simulated restart (the skip hazard); shutdown ordering (markwalk abandon mid-batch is safe).
+1. Refactor to packages with **no behavior change** (both still runnable via `--mode`).
+2. Unit tests: wakeup nudge (non-blocking, coalesced; under steady seals the batch count stays at
+   one per `--markwalk.every`); retention + counter-persistence across a simulated restart (the skip hazard);
+   markwalk error and panic back off and never stop the process; shutdown ordering (markwalk abandon
+   mid-batch is safe).
 3. Load test `both` at target event rate with markwalk deliberately slowed (large stat trees):
    confirm the collector's ack rate and Watch-drop count are **unaffected** by markwalk lag (proves
    the disk decoupling survived the merge).
 4. Backlog/catch-up test (§9): drive a burst so segments outpace markwalk, then confirm greedy drain
-   catches up without the `-every` throttle, retention bounds spool disk, and `spool_segments_pending`
+   catches up without the `--markwalk.every` throttle, retention bounds spool disk, and `spool_segments_pending`
    returns to baseline. Verify the collector is never stalled by the backlog.
 5. Idle test (§10): with no events for an extended period, confirm near-zero CPU — no periodic
    directory scans in `both` mode (markwalk blocked on the nudge/long timer), only the bounded
    collector/SDK timer wakeups. Then seal one segment and confirm the nudge wakes markwalk promptly.
 6. Fault injection: panic in markwalk → collector keeps sealing/acking; disk-full → collector fatal
    as today.
-7. Rollout: ship one binary; run `-mode both` co-located, or `collect`/`process` split — same spool
+7. Rollout: ship one binary; run `--mode both` co-located, or `collect`/`process` split — same spool
    contract.
 
 ---

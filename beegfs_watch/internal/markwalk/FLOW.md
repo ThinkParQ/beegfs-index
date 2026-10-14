@@ -8,21 +8,24 @@ numbers, one per line, and rescans exactly those directories.
 
 This program sits between the two.
 
-    Watch  --events-->  us  --suspect file-->  gufi_incremental_update
+    Watch --events--> collector --segments--> us --suspect file--> beegfs index update
 
 
 THE FLOW
 ========
 
-1. Watch dials in to us. We are the server, it is the client.
+1. Watch dials in to the collector, which seals the events into
+   segment files. We read those files. Both run in one binary,
+   beegfs-index-sync.
 
 2. For each event, work out which directories are now out of date.
    Put them in a set. Do nothing else.
 
-3. Every 5 seconds, take the set, turn it into inode numbers,
-   and write the suspect file.
+3. Per batch of segments, at most one per --markwalk.every, take the set, turn
+   it into inode numbers, and write the suspect file.
 
-4. Print the gufi_incremental_update command to run with that file.
+4. Leave it in <work>/batch-<N>/suspects for beegfs index update,
+   which runs gufi_incremental_update with it.
 
 Nothing heavy happens per event. A hundred writes to one directory
 become one entry in the set.
@@ -181,13 +184,14 @@ it just accepts the updated filesystem as is, however it got there.")
 KNOWN GAPS
 ==========
 
-1. We acknowledge the event as soon as it arrives, before GUFI has
-   run. A crash in between loses those events silently. A real
-   service must not acknowledge until the rescan has finished.
+1. Closed. The collector acknowledges an event only once its segment
+   is on disk, and we move our state only after the suspect file is
+   written. A crash repeats a batch; it never loses one.
 
 2. If no event for a subtree reaches us at all, nothing marks it.
    It stays stale until some later event touches something inside,
    and then the walk backfills the whole gap at once.
 
-3. This program writes the suspect file and prints the command.
-   It does not run GUFI, handle a failed run, or retry a batch.
+3. This program writes the suspect file. It does not run GUFI or
+   handle a failed run; that is beegfs index update's. A batch that
+   fails here is retried with backoff.
